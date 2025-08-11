@@ -1,0 +1,4 @@
+
+; For ion addition
+integrator  = steep
+nsteps      = 0

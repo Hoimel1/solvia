@@ -1,0 +1,25 @@
+
+; Martini 3 energy minimization
+integrator              = steep
+nsteps                  = 5000
+emtol                   = 100.0
+
+; Output
+nstlog                  = 100
+nstenergy               = 100
+
+; Cutoffs - Martini 3 settings
+cutoff-scheme           = Verlet
+nstlist                 = 20
+ns_type                 = grid
+pbc                     = xyz
+verlet-buffer-tolerance = 0.005
+
+; Electrostatics - Martini 3
+coulombtype             = reaction-field
+rcoulomb                = 1.1
+epsilon_r               = 15    ; Martini 3 
+epsilon_rf              = 0
+vdw_type                = cutoff
+vdw-modifier            = potential-shift-verlet
+rvdw                    = 1.1

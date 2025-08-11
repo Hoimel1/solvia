@@ -1,0 +1,42 @@
+; RBC-like membrane system with 16x SOLVIA_1
+; Generated with insane
+; Note: Using DPPC as substitute for PSM
+
+; Include force field parameters
+#include "martini_v3.0.0.itp"
+
+; Include lipid topologies
+#include "martini_v3.0.0_phospholipids_v1.itp"
+#include "martini_v3.0_sterols_v1.0.itp"
+
+; Include solvent and ion topologies
+#include "martini_v3.0.0_solvents_v1.itp"
+#include "martini_v3.0.0_ions_v1.itp"
+
+; Include peptide topology
+#include "SOLVIA_1_16x.itp"
+
+[ system ]
+; Name
+RBC-like membrane with 16x SOLVIA_1
+
+[ molecules ]
+; Compound        #mols
+; Target composition:
+; Outer: ~45% POPC, 10% DPPC (PSM substitute), 45% CHOL
+; Inner: ~45% POPE, 15% POPS, 40% CHOL
+
+SOLVIA_1         1
+POPC             66
+POPE             43
+POPS             14
+DPPC             9
+CHOL             82
+POPC             68
+POPE             45
+POPS             14
+DPPC             10
+CHOL             85
+W                12903
+NA               116
+CL               168

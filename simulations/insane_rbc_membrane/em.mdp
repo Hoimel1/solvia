@@ -1,0 +1,24 @@
+
+; Energy minimization for RBC membrane with peptides
+define                  = -DPOSRES  ; Position restrain peptides initially
+integrator              = steep
+nsteps                  = 20000
+emtol                   = 100.0     ; Lower tolerance for complex system
+emstep                  = 0.001     ; Smaller step size
+
+; Output
+nstlog                  = 1000
+nstenergy               = 1000
+
+; Cutoffs
+cutoff-scheme           = Verlet
+nstlist                 = 20
+pbc                     = xyz
+verlet-buffer-tolerance = 0.005
+
+; Electrostatics
+coulombtype             = reaction-field
+rcoulomb                = 1.1
+epsilon_r               = 15
+epsilon_rf              = 0
+rvdw                    = 1.1

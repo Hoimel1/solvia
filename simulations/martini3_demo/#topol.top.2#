@@ -1,0 +1,18 @@
+; Martini 3 demo system
+; Single SOLVIA_1 in water
+
+; Include Martini 3 force field
+#include "martini_v3.0.0.itp"
+#include "martini_v3.0.0_solvents_v1.itp"
+#include "martini_v3.0.0_ions_v1.itp"
+
+; Include peptide
+#include "SOLVIA_1.itp"
+
+[ system ]
+Martini 3 demo - SOLVIA_1 in water
+
+[ molecules ]
+SOLVIA_1    1
+; Water and ions to be added
+W                 643

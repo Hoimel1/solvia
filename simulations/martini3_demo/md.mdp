@@ -1,0 +1,38 @@
+; Martini 3 production
+integrator              = md
+dt                      = 0.025
+nsteps                  = 40000   ; 1 ns
+
+nstlog                  = 1000
+nstenergy               = 1000
+nstxout-compressed      = 1000
+
+constraint_algorithm    = lincs
+constraints             = none
+lincs_iter              = 1
+lincs_order             = 4
+
+cutoff-scheme           = Verlet
+nstlist                 = 20
+ns_type                 = grid
+pbc                     = xyz
+verlet-buffer-tolerance = 0.005
+
+coulombtype             = reaction-field
+rcoulomb                = 1.1
+epsilon_r               = 15
+epsilon_rf              = 0
+vdw_type                = cutoff
+vdw-modifier            = potential-shift-verlet
+rvdw                    = 1.1
+
+tcoupl                  = v-rescale
+tc-grps                 = system
+tau_t                   = 1.0
+ref_t                   = 310
+
+pcoupl                  = berendsen
+pcoupltype              = isotropic
+tau_p                   = 5.0
+ref_p                   = 1.0
+compressibility         = 3e-4
