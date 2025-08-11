@@ -10,7 +10,7 @@ SOLVIA integrates coarse-grained molecular dynamics (CG-MD) simulations with int
 - [x] Project setup and data preparation
 - [x] Module 1: Structure prediction (ColabFold) - Complete
 - [x] Module 2: Coarse-graining (martinize2) - Complete
-- [x] Module 3: MD simulations (GROMACS) - Setup Complete
+- [x] Module 3: MD simulations (GROMACS) - Martini 3 Setup Complete
 - [ ] Module 4: Feature extraction - Next
 - [ ] Module 5: ML model training
 
@@ -155,12 +155,35 @@ The setup creates:
 - Organized simulation directories in `simulations/systems/`
 
 ### Running simulations:
+
+#### Quick Martini 3 Demo:
 ```bash
-cd simulations/systems/SOLVIA_1
-bash submit.sh  # Or submit to cluster queue
+cd simulations/martini3_demo
+./run_demo.sh  # Runs single peptide in water
 ```
 
-**Note**: Full membrane insertion requires INSANE script and force field files.
+#### Full RBC Membrane Simulation:
+For physiologically accurate RBC membrane simulations with Martini 3:
+
+1. **Use CHARMM-GUI** (Recommended):
+   - Go to http://www.charmm-gui.org/
+   - Select "Martini Maker"
+   - Upload `simulations/membrane_16x/SOLVIA_1_16x.pdb`
+   - Choose Martini 3 force field
+   - Build asymmetric RBC membrane:
+     - Outer leaflet: 45% POPC, 10% PSM, 45% Cholesterol
+     - Inner leaflet: 45% POPE, 15% POPS, 40% Cholesterol
+
+2. **Import to local system**:
+   ```bash
+   # Copy CHARMM-GUI output files
+   cp charmm-gui-output/* simulations/rbc_membrane/
+   # Run simulation
+   cd simulations/rbc_membrane
+   bash run_simulation.sh
+   ```
+
+**Note**: We use only Martini 3 force fields. The `insane.py` tool generates Martini 2 format which is incompatible.
 
 ## Data Structure
 ```
