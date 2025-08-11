@@ -1,0 +1,20 @@
+
+For a complete membrane system, please use one of these methods:
+
+1. CHARMM-GUI Martini Maker (recommended):
+   - Go to http://www.charmm-gui.org/
+   - Select "Martini Maker"
+   - Upload your peptide structure
+   - Choose POPC bilayer
+   - Set 16 copies of peptide
+   - Download and convert to GROMACS format
+
+2. Manual construction:
+   - Build POPC bilayer using packmol or other tools
+   - Use gmx insert-molecules to add peptides
+   - Solvate with Martini water beads
+   - Add ions with gmx genion
+
+3. Use MemProtMD or similar services
+
+The current setup provides the framework, but needs proper membrane coordinates.

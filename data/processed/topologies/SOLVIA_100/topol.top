@@ -1,9 +1,9 @@
 
 #include "martini.itp"
-#include "molecule_0.itp"
+#include "SOLVIA_100.itp"
 
 [ system ]
 Title of the system
 
 [ molecules ]
-molecule_0    1
+SOLVIA_100    1

@@ -1,0 +1,34 @@
+
+; Include force field parameters
+#include "martini_v3.0.0.itp"
+#include "martini_v3.0.0_phospholipids_v1.itp"
+#include "martini_v3.0.0_solvents_v1.itp"
+#include "martini_v3.0.0_ions_v1.itp"
+#include "martini_v3.0_sterols_v1.0.itp"
+
+; Include peptide topology
+#include "SOLVIA_1.itp"
+
+[ system ]
+; Name
+16x SOLVIA_1 on asymmetric RBC membrane
+
+[ molecules ]
+; Compound        #mols
+SOLVIA_1    16
+
+; Outer leaflet (top)
+POPC             97
+; PSM would go here if available in Martini 3
+POPC             21  ; Using POPC as PSM substitute
+CHOL             97
+
+; Inner leaflet (bottom)
+POPE             97
+POPS             32
+CHOL             86
+
+; Solvent and ions (to be added)
+W                20000    ; Water beads
+NA+              100      ; Sodium ions
+CL-              100      ; Chloride ions

@@ -1,0 +1,18 @@
+
+; Include force field parameters
+#include "martini_v3.0.0.itp"
+#include "martini_v3.0.0_phospholipids_v1.itp"
+#include "martini_v3.0.0_solvents_v1.itp"
+#include "martini_v3.0.0_ions_v1.itp"
+
+; Include peptide topology
+#include "molecule_0.itp"
+
+[ system ]
+; Name
+16x SOLVIA_1 on POPC membrane in water
+
+[ molecules ]
+; Compound        #mols
+molecule_0          16
+; Will add POPC, W, NA, CL after building

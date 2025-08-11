@@ -1,0 +1,39 @@
+
+; NPT equilibration for asymmetric RBC membrane
+define                  = -DPOSRES_FC=500  ; Weaker restraints
+integrator              = md
+dt                      = 0.02
+nsteps                  = 250000    ; 5 ns
+
+; Output
+nstlog                  = 1000
+nstenergy               = 1000
+nstxout-compressed      = 5000
+
+; Temperature coupling
+tcoupl                  = v-rescale
+tc-grps                 = Protein POPC_POPE_PSM POPS CHOL W_ION
+tau_t                   = 1.0 1.0 1.0 1.0 1.0
+ref_t                   = 310 310 310 310 310
+
+; Pressure coupling - semi-isotropic for membrane
+pcoupl                  = berendsen
+pcoupltype              = semiisotropic
+tau_p                   = 5.0       ; Slower coupling for equilibration
+ref_p                   = 1.0 1.0   ; x-y and z separately
+compressibility         = 3e-4 3e-4
+
+; Constraints
+constraints             = none
+constraint-algorithm    = lincs
+
+; Cutoffs
+cutoff-scheme           = Verlet
+nstlist                 = 20
+pbc                     = xyz
+
+; Electrostatics
+coulombtype             = reaction-field
+rcoulomb                = 1.1
+epsilon_r               = 15
+rvdw                    = 1.1

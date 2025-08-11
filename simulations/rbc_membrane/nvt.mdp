@@ -1,0 +1,40 @@
+
+; NVT equilibration for asymmetric RBC membrane
+define                  = -DPOSRES -DPOSRES_FC=1000  ; Restrain peptides
+integrator              = md
+dt                      = 0.01      ; Smaller timestep initially
+nsteps                  = 100000    ; 1 ns
+
+; Output
+nstlog                  = 1000
+nstenergy               = 1000
+nstxout-compressed      = 5000
+
+; Temperature coupling - separate groups for asymmetric membrane
+tcoupl                  = v-rescale
+tc-grps                 = Protein POPC_POPE_PSM POPS CHOL W_ION
+tau_t                   = 1.0 1.0 1.0 1.0 1.0
+ref_t                   = 310 310 310 310 310
+
+; No pressure coupling in NVT
+pcoupl                  = no
+
+; Constraints
+constraints             = none
+constraint-algorithm    = lincs
+
+; Cutoffs
+cutoff-scheme           = Verlet
+nstlist                 = 20
+pbc                     = xyz
+
+; Electrostatics
+coulombtype             = reaction-field
+rcoulomb                = 1.1
+epsilon_r               = 15
+rvdw                    = 1.1
+
+; Velocity generation
+gen_vel                 = yes
+gen_temp                = 310
+gen_seed                = -1

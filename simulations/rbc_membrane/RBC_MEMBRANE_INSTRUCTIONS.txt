@@ -1,0 +1,59 @@
+
+RBC MEMBRANE BUILDING INSTRUCTIONS
+==================================
+
+Target composition:
+- Outer leaflet: ~45% POPC, 10% PSM, 45% Cholesterol  
+- Inner leaflet: ~45% POPE, 15% POPS, 40% Cholesterol
+
+Calculated numbers for 12.0x12.0 nm membrane:
+- Outer: 97 POPC, 21 PSM, 97 CHOL
+- Inner: 97 POPE, 32 POPS, 86 CHOL
+
+METHOD 1: CHARMM-GUI Martini Maker (Recommended)
+------------------------------------------------
+1. Go to http://www.charmm-gui.org/
+2. Select "Martini Maker" → "Membrane Builder"
+3. Choose "Asymmetric Bilayer"
+4. Set membrane composition:
+   - Upper leaflet: POPC (45%), PSM (10%), Cholesterol (45%)
+   - Lower leaflet: POPE (45%), POPS (15%), Cholesterol (40%)
+5. Upload peptides_16x.pdb as "Protein"
+6. Set box size to 12x12x15 nm
+7. Add 150 mM NaCl
+8. Download and convert to GROMACS format
+
+METHOD 2: insane.py (if available)
+----------------------------------
+# Build asymmetric membrane
+python insane.py \
+    -f peptides_16x.pdb \
+    -o system.gro \
+    -p system.top \
+    -x 12 -y 12 -z 15 \
+    -l POPC:97 -l POPE:97 \
+    -l POPS:32 -l CHOL:183 \
+    -u POPC:45 -u PSM:10 -u CHOL:45 \
+    -l POPE:45 -l POPS:15 -l CHOL:40 \
+    -sol W -salt 0.15
+
+METHOD 3: Manual Construction with PACKMOL
+------------------------------------------
+1. Use PACKMOL to arrange lipids in two leaflets
+2. Place peptides above membrane
+3. Solvate with Martini water beads
+4. Add ions to 150 mM NaCl
+
+NOTES:
+- PSM (Sphingomyelin) may not be available in Martini 3
+  Consider using DPPC or additional POPC as substitute
+- Ensure cholesterol flip-flop is restricted during equilibration
+- Use semi-isotropic pressure coupling for membrane systems
+- Apply position restraints on peptides during initial equilibration
+
+EQUILIBRATION PROTOCOL:
+1. Energy minimization (10,000 steps)
+2. NVT equilibration (1 ns) - restrain peptides and lipid headgroups
+3. NPT equilibration (5 ns) - semi-isotropic pressure coupling
+4. NPT equilibration (5 ns) - release peptide restraints
+5. Production run (100-500 ns)
