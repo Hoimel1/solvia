@@ -1,0 +1,31 @@
+# Core dependencies for SOLVIA
+
+# ColabFold requirements - will be installed separately
+# colabfold[alphafold]
+
+# MD and structure processing
+vermouth
+MDAnalysis
+
+# Data processing and ML
+numpy
+pandas
+scikit-learn
+xgboost
+shap
+
+# Utilities
+biopython
+tqdm
+pyyaml
+matplotlib
+seaborn
+
+# Workflow management
+snakemake
+
+# Development tools
+pytest
+black
+flake8
+jupyter
