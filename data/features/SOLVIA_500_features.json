@@ -1,0 +1,21 @@
+{
+  "peptide_id": "SOLVIA_500",
+  "features": {
+    "rmsd_mean": 4.8043391559742155,
+    "rmsd_std": 1.1570106574323724,
+    "rmsd_max": 5.500949996371323,
+    "rg_mean": 13.970508328757276,
+    "rg_std": 1.3260345079458369,
+    "n_exposed_beads": 45,
+    "membrane_contacts_mean": 34.50527657039258,
+    "membrane_contacts_max": 129.77924148867902,
+    "membrane_contacts_std": 22.894506701953038,
+    "energy_mean": -44614.09098283708,
+    "energy_std": 417.42910097521315,
+    "energy_drift": 99.60978223288853,
+    "msd": 35.1876215104509,
+    "mobility": 1.3004451546960851,
+    "membrane_perturbation": 0.5912391030271741
+  },
+  "mock_data": true
+}

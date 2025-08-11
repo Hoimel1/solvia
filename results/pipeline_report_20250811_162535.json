@@ -1,0 +1,72 @@
+{
+  "timestamp": "20250811_162535",
+  "config": {
+    "peptide_list": "data/raw/test_peptides.txt",
+    "fasta_dir": "data/raw/fasta_split",
+    "pdb_dir": "data/processed/pdb",
+    "cg_pdb_dir": "data/processed/cg_pdb",
+    "topology_dir": "data/processed/topologies",
+    "simulation_dir": "simulations/systems",
+    "feature_dir": "data/features",
+    "model_dir": "models",
+    "results_dir": "results",
+    "num_workers": 4,
+    "use_gpu": true,
+    "test_mode": true,
+    "skip_simulation_setup": true
+  },
+  "modules": {
+    "structure_prediction": {
+      "completed": 5,
+      "files": [
+        "SOLVIA_1000.pdb",
+        "SOLVIA_1.pdb",
+        "SOLVIA_100.pdb",
+        "SOLVIA_1001.pdb",
+        "SOLVIA_10.pdb"
+      ]
+    },
+    "coarse_graining": {
+      "completed": 5,
+      "files": [
+        "SOLVIA_100_cg.pdb",
+        "SOLVIA_1000_cg.pdb",
+        "SOLVIA_1001_cg.pdb",
+        "SOLVIA_1_cg.pdb",
+        "SOLVIA_10_cg.pdb"
+      ]
+    },
+    "feature_extraction": {
+      "n_samples": 28,
+      "n_features": 15
+    },
+    "ml_model": {
+      "model_type": "XGBoost",
+      "n_features": 15,
+      "feature_names": [
+        "rmsd_mean",
+        "rmsd_std",
+        "rmsd_max",
+        "rg_mean",
+        "rg_std",
+        "n_exposed_beads",
+        "membrane_contacts_mean",
+        "membrane_contacts_max",
+        "membrane_contacts_std",
+        "energy_mean",
+        "energy_std",
+        "energy_drift",
+        "msd",
+        "mobility",
+        "membrane_perturbation"
+      ],
+      "performance": {
+        "accuracy": 1.0,
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1": 1.0,
+        "auc": 1.0
+      }
+    }
+  }
+}

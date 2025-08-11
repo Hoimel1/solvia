@@ -1,0 +1,16 @@
+feature,xgb_importance,shap_importance
+rg_std,0.14511941,1.0806061
+mobility,0.1793449,0.86344415
+energy_std,0.12667033,0.6488109
+membrane_contacts_max,0.14139122,0.3891857
+n_exposed_beads,0.041689515,0.2455337
+rg_mean,0.1507272,0.23981273
+membrane_contacts_mean,0.06582008,0.20153719
+rmsd_mean,0.08198688,0.10344566
+energy_drift,0.0437697,0.08502724
+membrane_contacts_std,0.015628561,0.012947157
+energy_mean,0.0075808424,0.01027706
+msd,0.00027144517,0.00889666
+rmsd_max,0.0,0.0
+rmsd_std,0.0,0.0
+membrane_perturbation,0.0,0.0
