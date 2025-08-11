@@ -1,0 +1,23 @@
+#include "martini.itp"
+
+[ system ]
+; name
+Protein in INSANE! Membrane UpperLeaflet>M3.POPC:M3.POPE:M3.POPS:M3.PSM:M3.CHOL=7.0:5.0:2.0:1.0:5.0 LowerLeaflet>M3.POPC:M3.POPE:M3.POPS:M3.PSM:M3.CHOL=7.0:5.0:2.0:1.0:5.0
+
+
+[ molecules ]
+; name  number
+Protein          1
+POPC           233
+POPE           167
+POPS            66
+PSM             33
+CHOL           167
+POPC           233
+POPE           167
+POPS            66
+PSM             33
+CHOL           167
+W            34365
+NA             404
+CL             352
