@@ -9,8 +9,8 @@ SOLVIA integrates coarse-grained molecular dynamics (CG-MD) simulations with int
 ## Project Status
 - [x] Project setup and data preparation
 - [x] Module 1: Structure prediction (ColabFold) - Complete
-- [ ] Module 2: Coarse-graining (martinize2) - Next
-- [ ] Module 3: MD simulations (GROMACS)
+- [x] Module 2: Coarse-graining (martinize2) - Complete
+- [ ] Module 3: MD simulations (GROMACS) - Next
 - [ ] Module 4: Feature extraction
 - [ ] Module 5: ML model training
 
@@ -43,7 +43,7 @@ pip install -r requirements.txt
 
 4. Install specialized tools:
 - ColabFold (for structure prediction) - ✓ Installed
-- Martinize2 (for coarse-graining) - Pending
+- Martinize2 (for coarse-graining) - ✓ Installed
 - GROMACS (for MD simulations) - Pending
 - INSANE (for membrane building) - Pending
 
@@ -80,6 +80,38 @@ The script features:
 - Detailed logging to `logs/colabfold_batch.log`
 
 **Note**: Processing 2012 peptides will take significant time (~10-20 hours depending on GPU availability).
+
+## Module 2: Coarse-Graining (Martinize2)
+
+Martinize2 is installed via vermouth package. It converts atomistic PDB structures to coarse-grained representations for Martini simulations.
+
+### Single peptide:
+```bash
+martinize2 -f input.pdb -o topol.top -x output_cg.pdb -ff martini3001
+```
+
+### Batch processing:
+```bash
+# Test run (processes available PDB files)
+python scripts/batch_martinize2.py --test-run
+
+# Full run (all PDB files in data/processed/pdb/)
+python scripts/batch_martinize2.py
+
+# Custom parameters
+python scripts/batch_martinize2.py \
+    --force-field martini3001 \
+    --secondary-structure auto
+```
+
+The script features:
+- Automatic secondary structure determination for short peptides
+- Progress tracking and resume capability
+- Organized topology output
+- Saves CG-PDB to `data/processed/cg_pdb/`
+- Saves topologies to `data/processed/topologies/`
+
+**Results**: Average ~49 beads per peptide (from ~350 atoms)
 
 ## Data Structure
 ```
