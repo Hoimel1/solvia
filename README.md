@@ -10,8 +10,8 @@ SOLVIA integrates coarse-grained molecular dynamics (CG-MD) simulations with int
 - [x] Project setup and data preparation
 - [x] Module 1: Structure prediction (ColabFold) - Complete
 - [x] Module 2: Coarse-graining (martinize2) - Complete
-- [ ] Module 3: MD simulations (GROMACS) - Next
-- [ ] Module 4: Feature extraction
+- [x] Module 3: MD simulations (GROMACS) - Setup Complete
+- [ ] Module 4: Feature extraction - Next
 - [ ] Module 5: ML model training
 
 ## Installation
@@ -44,8 +44,8 @@ pip install -r requirements.txt
 4. Install specialized tools:
 - ColabFold (for structure prediction) - ✓ Installed
 - Martinize2 (for coarse-graining) - ✓ Installed
-- GROMACS (for MD simulations) - Pending
-- INSANE (for membrane building) - Pending
+- GROMACS (for MD simulations) - ✓ Installed
+- INSANE (for membrane building) - Pending (alternative setup available)
 
 ## Module 1: Structure Prediction (ColabFold)
 
@@ -112,6 +112,55 @@ The script features:
 - Saves topologies to `data/processed/topologies/`
 
 **Results**: Average ~49 beads per peptide (from ~350 atoms)
+
+## Module 3: MD Simulations (GROMACS)
+
+GROMACS 2021.4 is installed for running molecular dynamics simulations.
+
+### Force Field Setup
+**Important**: Upload your Martini force field files to:
+- `force_fields/martini3/` - For Martini 3 force field files
+- `force_fields/martini2/` - For Martini 2 force field files (if needed)
+
+Required files:
+- `martini_v3.0.0_solvents_v1.itp` - Water and ion topologies
+- `martini_v3.0.0_phospholipids_v1.itp` - Lipid topologies
+- Additional ITP files as needed
+
+### Single peptide simulation setup:
+```bash
+python scripts/setup_membrane_simulation.py \
+    --peptide-id SOLVIA_1 \
+    --cg-pdb data/processed/cg_pdb/SOLVIA_1_cg.pdb \
+    --topology-dir data/processed/topologies \
+    --output-dir simulations/systems
+```
+
+### Batch simulation setup:
+```bash
+# Test run (first 5 peptides)
+python scripts/batch_simulation_setup.py --test-run
+
+# Full run (all CG peptides)
+python scripts/batch_simulation_setup.py
+
+# Parallel processing
+python scripts/batch_simulation_setup.py --num-workers 4
+```
+
+The setup creates:
+- Box generation around peptide
+- MDP files for energy minimization, equilibration (NVT/NPT), and production
+- Job submission scripts
+- Organized simulation directories in `simulations/systems/`
+
+### Running simulations:
+```bash
+cd simulations/systems/SOLVIA_1
+bash submit.sh  # Or submit to cluster queue
+```
+
+**Note**: Full membrane insertion requires INSANE script and force field files.
 
 ## Data Structure
 ```
