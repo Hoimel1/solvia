@@ -1,0 +1,15 @@
+2025-08-11 14:22:06,062 Running colabfold 1.5.5 (04545332cd2759528721711a86a2c8d28566a8c6)
+2025-08-11 14:22:06,321 Running on GPU
+2025-08-11 14:22:06,534 Found 5 citations for tools or databases
+2025-08-11 14:22:06,534 Query 1/1: SOLVIA_1000_Dendropsophin_1 (length 17)
+2025-08-11 14:22:06,904 Sleeping for 8s. Reason: PENDING
+2025-08-11 14:22:15,276 Sleeping for 10s. Reason: PENDING
+2025-08-11 14:22:26,435 Setting max_seq=2, max_extra_seq=1
+2025-08-11 14:23:52,916 alphafold2_ptm_model_1_seed_000 recycle=0 pLDDT=92.8 pTM=0.0439
+2025-08-11 14:24:18,998 alphafold2_ptm_model_1_seed_000 recycle=1 pLDDT=91.2 pTM=0.0433 tol=0.121
+2025-08-11 14:24:19,033 alphafold2_ptm_model_1_seed_000 recycle=2 pLDDT=90.9 pTM=0.0433 tol=0.0575
+2025-08-11 14:24:19,068 alphafold2_ptm_model_1_seed_000 recycle=3 pLDDT=90.5 pTM=0.0432 tol=0.105
+2025-08-11 14:24:19,068 alphafold2_ptm_model_1_seed_000 took 104.2s (3 recycles)
+2025-08-11 14:24:19,071 reranking models by 'plddt' metric
+2025-08-11 14:24:19,071 rank_001_alphafold2_ptm_model_1_seed_000 pLDDT=90.5 pTM=0.0432
+2025-08-11 14:24:19,476 Done

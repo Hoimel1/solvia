@@ -1,0 +1,13 @@
+2025-08-11 14:19:59,070 Running colabfold 1.5.5 (04545332cd2759528721711a86a2c8d28566a8c6)
+2025-08-11 14:19:59,331 Running on GPU
+2025-08-11 14:19:59,544 Found 5 citations for tools or databases
+2025-08-11 14:19:59,544 Query 1/1: SOLVIA_100_M-zodatoxin-Lt2a__I7Q___Latarcin-2a__I7Q___Ltc-2a__I7Q_ (length 26)
+2025-08-11 14:20:00,715 Setting max_seq=2, max_extra_seq=1
+2025-08-11 14:21:29,720 alphafold2_ptm_model_1_seed_000 recycle=0 pLDDT=73.2 pTM=0.228
+2025-08-11 14:21:58,413 alphafold2_ptm_model_1_seed_000 recycle=1 pLDDT=76.9 pTM=0.248 tol=0.107
+2025-08-11 14:21:58,456 alphafold2_ptm_model_1_seed_000 recycle=2 pLDDT=76.6 pTM=0.243 tol=0.0519
+2025-08-11 14:21:58,498 alphafold2_ptm_model_1_seed_000 recycle=3 pLDDT=77.3 pTM=0.245 tol=0.0696
+2025-08-11 14:21:58,499 alphafold2_ptm_model_1_seed_000 took 109.4s (3 recycles)
+2025-08-11 14:21:58,502 reranking models by 'plddt' metric
+2025-08-11 14:21:58,502 rank_001_alphafold2_ptm_model_1_seed_000 pLDDT=77.3 pTM=0.245
+2025-08-11 14:21:58,870 Done

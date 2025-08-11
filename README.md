@@ -8,8 +8,8 @@ SOLVIA integrates coarse-grained molecular dynamics (CG-MD) simulations with int
 
 ## Project Status
 - [x] Project setup and data preparation
-- [ ] Module 1: Structure prediction (ColabFold) - In Progress
-- [ ] Module 2: Coarse-graining (martinize2)
+- [x] Module 1: Structure prediction (ColabFold) - Complete
+- [ ] Module 2: Coarse-graining (martinize2) - Next
 - [ ] Module 3: MD simulations (GROMACS)
 - [ ] Module 4: Feature extraction
 - [ ] Module 5: ML model training
@@ -42,12 +42,44 @@ pip install -r requirements.txt
 ```
 
 4. Install specialized tools:
-- ColabFold (for structure prediction)
-- Martinize2 (for coarse-graining)
-- GROMACS (for MD simulations)
-- INSANE (for membrane building)
+- ColabFold (for structure prediction) - ✓ Installed
+- Martinize2 (for coarse-graining) - Pending
+- GROMACS (for MD simulations) - Pending
+- INSANE (for membrane building) - Pending
 
-Detailed installation instructions coming soon...
+## Module 1: Structure Prediction (ColabFold)
+
+ColabFold has been installed locally in `localcolabfold/`. To run structure predictions:
+
+### Single sequence:
+```bash
+export PATH="/home/michelhuller/solvia/localcolabfold/localcolabfold/colabfold-conda/bin:$PATH"
+colabfold_batch input.fasta output_dir
+```
+
+### Batch processing for all peptides:
+```bash
+# Test run (first 5 sequences only)
+python scripts/batch_colabfold.py --test-run
+
+# Full run (all 2012 peptides)
+python scripts/batch_colabfold.py
+
+# Custom parameters
+python scripts/batch_colabfold.py \
+    --num-models 5 \
+    --num-recycle 3 \
+    --batch-size 10
+```
+
+The script features:
+- Automatic progress tracking and resume capability
+- MSA queries with rate limiting
+- GPU support (when available)
+- Saves best-ranked PDB to `data/processed/pdb/`
+- Detailed logging to `logs/colabfold_batch.log`
+
+**Note**: Processing 2012 peptides will take significant time (~10-20 hours depending on GPU availability).
 
 ## Data Structure
 ```
