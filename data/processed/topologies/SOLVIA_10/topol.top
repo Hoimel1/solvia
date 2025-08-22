@@ -1,9 +1,0 @@
-
-#include "martini.itp"
-#include "SOLVIA_10.itp"
-
-[ system ]
-Title of the system
-
-[ molecules ]
-SOLVIA_10    1

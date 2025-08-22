@@ -1,51 +1,66 @@
-# Virtual environment
-venv/
-
 # Python
 __pycache__/
 *.py[cod]
-*$py.class
 *.so
-.Python
+*.pyd
+*.pyo
+*.pyi
 *.egg-info/
-dist/
-build/
+.eggs/
+.mypy_cache/
+.pytype/
+pytestdebug.log
+pytestcache/
+.pytest_cache/
 
-# Data files
-*.xtc
-*.gro
-*.tpr
-*.edr
-*.log
-*.xvg
-*.pdb
+# Environments
+.env
+.env.*
+.venv/
+venv/
 
-# Temporary files
-*.tmp
-*.swp
-*.swo
-*~
-
-# IDE
+# Editors/IDE
 .vscode/
 .idea/
-*.sublime-*
-
-# OS
+*.swp
+*.swo
 .DS_Store
-Thumbs.db
 
-# Logs
-logs/*.log
+# Build/dist
+build/
+dist/
+*.egg
+pip-wheel-metadata/
+htmlcov/
+.coverage*
+.tox/
 
-# Large data files
-data/processed/pdb/*
-!data/processed/pdb/.gitkeep
-data/processed/cg_pdb/*
-!data/processed/cg_pdb/.gitkeep
+# Logs & runtime
+logs/
+*.log
 
-# ColabFold models (will be downloaded)
-localcolabfold/
+# Data outputs (keep raw inputs versioned)
+data/intermediate/
+data/output/
+colabfold_cache/
+
+# Simulations and large generated artifacts
+simulations/
+**/*.xtc
+**/*.gro
+**/*.tpr
+**/*.edr
+**/*.cpt
+**/*.log.[0-9]*
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Local software builds
+software/gromacs-gpu-*/
 
 # Snakemake
 .snakemake/
+
+# Sphinx build
+docs/_build/

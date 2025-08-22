@@ -1,0 +1,11 @@
+libdir=/home/michelhuller/solvia/software/gromacs-gpu-89/lib
+
+Name: libgromacs
+Description: Gromacs library
+URL: http://www.gromacs.org
+Version: 2023.3
+Requires:  
+Libs.private:   
+Libs: -L${libdir} -lgromacs  -lm
+Cflags:  -I/home/michelhuller/solvia/software/gromacs-gpu-89/include -DGMX_DOUBLE=0 -fopenmp
+

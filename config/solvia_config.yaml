@@ -1,0 +1,109 @@
+# SOLVIA Configuration File
+# Evidence-based parameters for hemolytic toxicity prediction
+
+# General settings
+project:
+  name: "SOLVIA"
+  version: "1.0.0"
+  description: "In-silico hemolytic toxicity screening for antimicrobial peptides"
+
+# Directory structure
+directories:
+  simulations_base: "/home/michelhuller/solvia/simulations"
+  data_base: "/home/michelhuller/solvia/data"
+  templates: "/home/michelhuller/solvia/data/templates"
+  force_fields: "/home/michelhuller/solvia/force_fields"
+  scripts: "/home/michelhuller/solvia/scripts/universal"
+
+# ColabFold parameters
+colabfold:
+  num_models: 5
+  num_replicates: 3
+  min_plddt: 80  # Minimum pLDDT score to proceed
+  msa_mode: "mmseqs2_uniref_env"
+  pair_mode: "unpaired_paired"
+  relax: false
+
+# Martinize2 parameters
+coarse_graining:
+  force_field: "martini3001"
+  c_terminal: "NH2-ter"  # Amidated C-terminus
+  dssp: true  # Use DSSP for secondary structure
+  elastic_network: false
+  position_restraints: true
+  restraint_force: 1000
+
+# RBC membrane parameters (evidence-based from concept)
+membrane:
+  type: "asymmetric_rbc"
+  box_size: [10, 10, 14]  # nm
+  thickness: 4.5  # nm (physiological)
+  
+  # Outer leaflet composition
+  upper_leaflet:
+    POPC: 0.40  # 40% (physiological RBC outer leaflet)
+    PSM: 0.15   # 15% (sphingomyelin)
+    CHOL: 0.45  # 45% (cholesterol - high for RBC membrane)
+  
+  # Inner leaflet composition  
+  lower_leaflet:
+    POPE: 0.45  # 45% (phosphatidylethanolamine)
+    POPS: 0.15  # 15% (phosphatidylserine - negatively charged)
+    CHOL: 0.40  # 40% (cholesterol - slightly lower than outer)
+  
+  # Solvent and ions
+  solvent: "W"  # Water
+  salt_concentration: 0.15  # 150 mM (physiological)
+
+# Peptide insertion parameters
+peptide_insertion:
+  arrangement: "3-2-3"  # 3 rows: 3 peptides, 2 peptides, 3 peptides
+  total_peptides: 8  # Standard occupancy
+  distance_from_membrane: 3.0  # nm above membrane surface
+  minimum_spacing: 2.5  # nm between peptides
+  
+  # Multi-occupancy levels for testing
+  occupancy_levels:
+    low: 8     # P:L ratio ~1:42
+    medium: 12 # P:L ratio ~1:28
+    high: 16   # P:L ratio ~1:21
+
+# MD simulation parameters
+simulation:
+  timestep: 0.02  # 20 fs for Martini
+  temperature: 310  # K (physiological)
+  pressure: 1.0  # bar
+  
+  # Equilibration steps
+  em:
+    emtol: 100
+    nsteps: 50000
+  
+  nvt:
+    time: 50  # ps
+    tau_t: 1.0
+  
+  npt:
+    time: 100  # ps
+    tau_t: 1.0
+    tau_p: 12.0
+    compressibility: 4.5e-5
+  
+  # Production run
+  production:
+    time: 400  # ns (increased from 200 ns)
+    output_frequency: 100  # ps
+    analysis_fraction: 0.2  # Analyze last 20% of trajectory
+
+# ML parameters
+machine_learning:
+  toxic_threshold: 100  # HC50 ≤ 100 µM = toxic
+  test_split: 0.15
+  validation_split: 0.15
+  random_seed: 42
+  
+# Performance parameters
+performance:
+  cpu_threads: 8
+  gpu: true
+  max_warnings: 2

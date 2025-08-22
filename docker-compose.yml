@@ -1,0 +1,25 @@
+version: '3.8'
+
+services:
+  colabfold:
+    build:
+      context: ./docker
+      dockerfile: Dockerfile
+    image: ghcr.io/solvia/colabfold:latest
+    volumes:
+      - .:/work
+      - ./colabfold_cache:/cache
+    environment:
+      - COLABFOLD_DB=/cache/colabfold_envdb_202308
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    runtime: nvidia
+    working_dir: /work
+
+volumes:
+  colabfold_cache:
+    driver: local
+
+networks:
+  default:
+    name: solvia-network

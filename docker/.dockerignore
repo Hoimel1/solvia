@@ -1,0 +1,3 @@
+# Only build with Dockerfile context
+**
+!Dockerfile

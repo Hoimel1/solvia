@@ -1,0 +1,76 @@
+# SOLVIA Configuration File
+# Based on core scientific concept (Section 4) and quality framework (Section 6)
+
+# Input files
+input:
+  sequences_dir: "data/input/sequences"
+  labels_file: "data/input/labels/hemolytic_labels.csv"
+  
+# Structure prediction (ColabFold)
+structure_prediction:
+  num_seeds: 5
+  model_preset: "alphafold2_multimer_v3"
+  plddt_threshold: 70  # For IDP classification
+  
+# Coarse-graining (martinize2)
+coarse_graining:
+  forcefield: "martini3001"
+  elastic_network: false
+  idp_flag: true  # Use --martini3-idp for low pLDDT
+  
+# Membrane setup (INSANE)
+membrane:
+  box_size: [40, 40, 25]  # nm, larger box as per optimization
+  composition:
+    outer_leaflet:
+      POPC: 0.45
+      PSM: 0.10
+      CHOL: 0.45
+    inner_leaflet:
+      POPE: 0.45
+      POPS: 0.15
+      CHOL: 0.40
+  salt_concentration: 0.15  # M
+  
+# MD simulation parameters
+simulation:
+  occupancies:
+    low: 8
+    medium: 12
+    high: 16
+  replicates: 3
+  temperature: 310  # K
+  timestep: 0.020  # ps (20 fs for Martini 3)
+  production_time: 500  # ns
+  output_frequency: 1000  # ps
+  
+# Machine learning
+ml:
+  model: "xgboost"
+  toxicity_threshold: 100  # µM (HC50 <= 100 is toxic)
+  test_split: 0.15
+  validation_split: 0.15
+  hyperparameter_optimization: true
+  random_seed: 42
+  
+# Quality control thresholds
+qc:
+  thresholds:
+    min_roc_auc: 0.85
+    min_pr_auc: 0.80
+    max_mae: 0.5  # log units for HC50
+    
+# Computational resources
+resources:
+  max_cores: 8
+  gpu_enabled: true
+  max_memory_gb: 32
+  
+# Docker images
+containers:
+  colabfold: "solvia/colabfold:latest"
+  martinize: "solvia/martinize2:latest"
+  insane: "solvia/insane:latest"
+  gromacs: "solvia/gromacs:2025.2-cuda12"
+  ml: "solvia/ml-toolkit:latest"
+

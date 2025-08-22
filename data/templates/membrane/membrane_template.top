@@ -1,0 +1,18 @@
+#include "martini.itp"
+
+[ system ]
+; name
+INSANE! Membrane UpperLeaflet>POPC:PSM:CHOL=0.4:0.15:0.45 LowerLeaflet>POPE:POPS:CHOL=0.45:0.15:0.4
+
+
+[ molecules ]
+; name  number
+POPC            67
+PSM             25
+CHOL            76
+POPE            76
+POPS            25
+CHOL            67
+W             8260
+NA             103
+CL              78
