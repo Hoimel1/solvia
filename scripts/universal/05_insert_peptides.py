@@ -10,6 +10,8 @@ import yaml
 import shutil
 import argparse
 import numpy as np
+import math
+import zlib
 from pathlib import Path
 
 def load_config():
@@ -82,11 +84,44 @@ def find_membrane_top(membrane_gro):
         # Fallback: estimate based on box
         return 8.5
 
-def calculate_peptide_positions(n_peptides, box_size, spacing):
-    """Calculate positions for 3-2-3 arrangement"""
+def _poisson_disk_sample(n_points: int, width: float, height: float, min_dist: float, 
+                         rng: np.random.Generator, max_attempts: int = 10000) -> list:
+    """Simple dart-throw Poisson-disk sampling in [margin, width-margin]×[margin, height-margin]."""
+    margin = min_dist
+    points: list[list[float]] = []
+    attempts = 0
+    while len(points) < n_points and attempts < max_attempts:
+        attempts += 1
+        x = rng.uniform(margin, max(margin, width - margin))
+        y = rng.uniform(margin, max(margin, height - margin))
+        ok = True
+        for px, py in points:
+            if (x - px) ** 2 + (y - py) ** 2 < (min_dist ** 2):
+                ok = False
+                break
+        if ok:
+            points.append([float(x), float(y)])
+    return points
+
+
+def calculate_peptide_positions(n_peptides, box_size, spacing, placement: str, rng: np.random.Generator):
+    """Calculate XY positions for peptide placement.
+
+    - For 1 peptide: place at box center.
+    - For known counts (8, 12, 16): use predefined grids.
+    - For other counts: distribute on a simple grid within [1.5, box-1.5].
+    """
     positions = []
     
-    if n_peptides == 8:
+    if placement == "poisson" and n_peptides > 0:
+        pts = _poisson_disk_sample(n_peptides, box_size[0], box_size[1], spacing, rng)
+        # If not enough points found, fall back to grid below
+        if len(pts) >= n_peptides:
+            return pts[:n_peptides]
+
+    if n_peptides == 1:
+        positions = [[box_size[0] / 2.0, box_size[1] / 2.0]]
+    elif n_peptides == 8:
         # 3-2-3 arrangement
         rows = [3, 2, 3]
         y_positions = [2.5, 5.0, 7.5]  # nm
@@ -114,15 +149,61 @@ def calculate_peptide_positions(n_peptides, box_size, spacing):
             for x in np.linspace(1.5, 8.5, 4):
                 positions.append([x, y])
     
+    else:
+        # Generic fallback grid
+        grid_n = int(np.ceil(np.sqrt(n_peptides)))
+        xs = np.linspace(1.5, max(1.6, box_size[0] - 1.5), grid_n)
+        ys = np.linspace(1.5, max(1.6, box_size[1] - 1.5), grid_n)
+        for y in ys:
+            for x in xs:
+                positions.append([float(x), float(y)])
+                if len(positions) >= n_peptides:
+                    break
+            if len(positions) >= n_peptides:
+                break
+
     return positions[:n_peptides]
 
-def insert_peptides(run_dir, occupancy="low"):
+
+def _rotation_matrix(angle_deg: float, axis: str) -> np.ndarray:
+    angle = math.radians(angle_deg)
+    if axis == 'x':
+        return np.array([[1, 0, 0],
+                         [0, math.cos(angle), -math.sin(angle)],
+                         [0, math.sin(angle),  math.cos(angle)]], dtype=float)
+    if axis == 'y':
+        return np.array([[ math.cos(angle), 0, math.sin(angle)],
+                         [0, 1, 0],
+                         [-math.sin(angle), 0, math.cos(angle)]], dtype=float)
+    # default z
+    return np.array([[math.cos(angle), -math.sin(angle), 0],
+                     [math.sin(angle),  math.cos(angle), 0],
+                     [0, 0, 1]], dtype=float)
+
+
+def _orientation_to_angle(orientation: str, rng: np.random.Generator) -> float:
+    orientation = (orientation or "random").lower()
+    if orientation == "parallel":
+        return 0.0
+    if orientation in ("45", "tilt45", "tilt_45"):
+        return 45.0
+    if orientation in ("perpendicular", "orthogonal", "90"):
+        return 90.0
+    # random choice from pools
+    return float(rng.choice([0.0, 45.0, 90.0]))
+
+def insert_peptides(run_dir, occupancy="low", n_peptides_override=None, placement: str = "poisson", orientation: str = "random", replicates: int = 1):
     """Insert peptides above membrane"""
     config = load_config()
     metadata = load_run_metadata(run_dir)
     
-    # Get number of peptides based on occupancy
-    n_peptides = config['peptide_insertion']['occupancy_levels'][occupancy]
+    # Get number of peptides based on occupancy or override
+    if n_peptides_override is not None and n_peptides_override > 0:
+        n_peptides = int(n_peptides_override)
+        occupancy_label = f"n{n_peptides}"
+    else:
+        n_peptides = config['peptide_insertion']['occupancy_levels'][occupancy]
+        occupancy_label = occupancy
     
     # Input files
     peptide_gro = os.path.join(run_dir, "cg_pdb", f"{metadata['peptide_id']}_cg.pdb")
@@ -138,17 +219,10 @@ def insert_peptides(run_dir, occupancy="low"):
             run_dir
         ], check=True)
     
-    # Output files
+    # Output directory
     output_dir = os.path.join(run_dir, "system")
-    output_gro = os.path.join(output_dir, f"system_{occupancy}.gro")
-    output_top = os.path.join(output_dir, f"system_{occupancy}.top")
-    
-    # Check if already done
-    if os.path.exists(output_gro) and os.path.exists(output_top):
-        print(f"System with {occupancy} occupancy already exists.")
-        return output_gro, output_top
-    
-    print(f"Inserting {n_peptides} peptides ({occupancy} occupancy)...")
+    os.makedirs(output_dir, exist_ok=True)
+    print(f"Inserting {n_peptides} peptide(s) ({occupancy_label}), replicates={replicates}...")
     
     # Convert PDB to GRO if needed
     if peptide_gro.endswith('.pdb'):
@@ -168,63 +242,101 @@ def insert_peptides(run_dir, occupancy="low"):
     print(f"Membrane top at z={membrane_top:.2f} nm")
     print(f"Peptide dimensions: {peptide_dims[0]:.2f} x {peptide_dims[1]:.2f} x {peptide_dims[2]:.2f} nm")
     
-    # Calculate positions
-    positions = calculate_peptide_positions(n_peptides, box_size, 
-                                          config['peptide_insertion']['minimum_spacing'])
-    z_position = membrane_top + config['peptide_insertion']['distance_from_membrane']
-    
-    # Place peptides
-    all_atoms = []
-    atom_counter = 0
-    
-    # Add peptides first (to match topology order)
-    for i, (x, y) in enumerate(positions):
-        print(f"  Placing peptide {i+1} at ({x:.1f}, {y:.1f}, {z_position:.1f})")
+    last_gro, last_top = None, None
+    for rep in range(1, max(1, replicates) + 1):
+        rep_tag = f"{occupancy_label}_rep{rep}" if replicates > 1 else occupancy_label
+        output_gro = os.path.join(output_dir, f"system_{rep_tag}.gro")
+        output_top = os.path.join(output_dir, f"system_{rep_tag}.top")
+
+        if os.path.exists(output_gro) and os.path.exists(output_top):
+            print(f"System already exists: {rep_tag}")
+            last_gro, last_top = output_gro, output_top
+            continue
+
+        # RNG seed (deterministic per peptide/run/rep)
+        seed_str = f"{metadata['peptide_id']}|{n_peptides}|{occupancy_label}|rep{rep}"
+        seed = zlib.crc32(seed_str.encode('utf-8')) & 0xFFFFFFFF
+        rng = np.random.default_rng(seed)
+
+        # Calculate positions
+        positions = calculate_peptide_positions(
+            n_peptides,
+            box_size,
+            config['peptide_insertion']['minimum_spacing'],
+            placement,
+            rng
+        )
+        z_position = membrane_top + config['peptide_insertion']['distance_from_membrane']
+
+        # Orientation handling (tilt around x-axis relative to membrane plane z)
+        tilt_deg = _orientation_to_angle(orientation, rng)
+        rot = _rotation_matrix(tilt_deg, axis='x')
+
+        # Place peptides
+        all_atoms = []
+        atom_counter = 0
+
+        # Add peptides first (to match topology order)
+        for i, (x, y) in enumerate(positions):
+            print(f"  [{rep_tag}] Placing peptide {i+1} at ({x:.1f}, {y:.1f}, {z_position:.1f}); tilt={tilt_deg:.1f}°")
+            
+            for line in peptide_atoms:
+                if len(line) > 44:
+                    # Parse atom line
+                    resid = int(line[0:5])
+                    resname = line[5:10]
+                    atomname = line[10:15]
+                    atomid = atom_counter + 1
+                    
+                    # Get original coordinates
+                    orig_x = float(line[20:28])
+                    orig_y = float(line[28:36])
+                    orig_z = float(line[36:44])
+
+                    # Translate to peptide-centered coords
+                    vx = orig_x - peptide_center[0]
+                    vy = orig_y - peptide_center[1]
+                    vz = orig_z - peptide_center[2]
+
+                    # Rotate around x-axis by tilt
+                    rx, ry, rz = rot @ np.array([vx, vy, vz])
+
+                    # Translate to target position (x,y,z)
+                    new_x = rx + x
+                    new_y = ry + y
+                    new_z = rz + z_position
+                    
+                    # Write new atom line
+                    new_line = f"{resid:5d}{resname}{atomname}{atomid:5d}{new_x:8.3f}{new_y:8.3f}{new_z:8.3f}\n"
+                    all_atoms.append(new_line)
+                    atom_counter += 1
         
-        for line in peptide_atoms:
+        # Add membrane atoms
+        for line in membrane_atoms:
             if len(line) > 44:
-                # Parse atom line
-                resid = int(line[0:5])
-                resname = line[5:10]
-                atomname = line[10:15]
                 atomid = atom_counter + 1
-                
-                # Get original coordinates
-                orig_x = float(line[20:28])
-                orig_y = float(line[28:36])
-                orig_z = float(line[36:44])
-                
-                # Calculate new coordinates (center peptide and move to position)
-                new_x = orig_x - peptide_center[0] + x
-                new_y = orig_y - peptide_center[1] + y
-                new_z = orig_z - peptide_center[2] + z_position
-                
-                # Write new atom line
-                new_line = f"{resid:5d}{resname}{atomname}{atomid:5d}{new_x:8.3f}{new_y:8.3f}{new_z:8.3f}\n"
-                all_atoms.append(new_line)
+                atomid_str = f"{atomid:5d}"
+                line = line[:15] + atomid_str + line[20:]
+                all_atoms.append(line)
                 atom_counter += 1
-    
-    # Add membrane atoms
-    for line in membrane_atoms:
-        if len(line) > 44:
-            # Update atom number
-            parts = list(line)
-            atomid = atom_counter + 1
-            atomid_str = f"{atomid:5d}"
-            line = line[:15] + atomid_str + line[20:]
-            all_atoms.append(line)
-            atom_counter += 1
-    
-    # Write combined GRO file
-    header = f"System with {n_peptides} {metadata['peptide_id']} peptides; {occupancy} occupancy\n"
-    write_gro_file(output_gro, header, all_atoms, box_line)
-    
-    print(f"✓ Created system with {n_peptides} peptides: {output_gro}")
-    
-    # Create topology
-    create_system_topology(run_dir, metadata['peptide_id'], n_peptides, occupancy)
-    
-    return output_gro, output_top
+        
+        # Write combined GRO file
+        header = f"System with {n_peptides} {metadata['peptide_id']} peptides; {rep_tag}\n"
+        write_gro_file(output_gro, header, all_atoms, box_line)
+        print(f"✓ Created system: {output_gro}")
+
+        # Create topology for this replicate
+        create_system_topology(run_dir, metadata['peptide_id'], n_peptides, rep_tag)
+        # Move to replicate-specific filename if created under occupancy-only name
+        default_top = os.path.join(output_dir, f"system_{occupancy_label}.top")
+        if os.path.exists(default_top) and default_top != output_top:
+            try:
+                shutil.move(default_top, output_top)
+            except Exception:
+                pass
+        last_gro, last_top = output_gro, output_top
+
+    return last_gro, last_top
 
 def convert_pdb_to_gro(pdb_file, gro_file):
     """Convert PDB to GRO format (simple conversion)"""
@@ -255,7 +367,7 @@ def convert_pdb_to_gro(pdb_file, gro_file):
             f.write(atom)
         f.write("  10.000  10.000  14.000\n")  # Default box
 
-def create_system_topology(run_dir, peptide_id, n_peptides, occupancy):
+def create_system_topology(run_dir, peptide_id, n_peptides, tag):
     """Create system topology file"""
     config = load_config()
     
@@ -278,8 +390,28 @@ def create_system_topology(run_dir, peptide_id, n_peptides, occupancy):
                     if mol_name not in ['INSANE!']:  # Skip system name
                         membrane_molecules.append((mol_name, int(mol_count)))
     
+    # Determine peptide moleculetype name from ITP
+    peptide_itp = os.path.join(run_dir, "cg_pdb", f"{peptide_id}.itp")
+    peptide_moltype = peptide_id
+    try:
+        with open(peptide_itp, 'r') as f:
+            lines = [l.strip() for l in f]
+        for i, l in enumerate(lines):
+            if l.startswith('[') and 'moleculetype' in l:
+                # next non-empty, non-comment line
+                for j in range(i+1, len(lines)):
+                    s = lines[j]
+                    if not s or s.startswith(';'):
+                        continue
+                    peptide_moltype = s.split()[0]
+                    raise StopIteration
+    except StopIteration:
+        pass
+    except Exception:
+        pass
+
     # Create topology
-    top_content = f"""; System topology for {peptide_id} with {occupancy} occupancy
+    top_content = f"""; System topology for {peptide_id} with tag {tag}
 ; Generated by SOLVIA peptide insertion script
 
 ; Include force field
@@ -299,7 +431,7 @@ def create_system_topology(run_dir, peptide_id, n_peptides, occupancy):
 
 [ molecules ]
 ; Peptides first (to match GRO order)
-{peptide_id}_0    {n_peptides}
+{peptide_moltype:12s} {n_peptides}
 """
     
     # Add membrane molecules
@@ -307,7 +439,7 @@ def create_system_topology(run_dir, peptide_id, n_peptides, occupancy):
         top_content += f"{mol_name:8s} {mol_count:6d}\n"
     
     # Write topology
-    output_top = os.path.join(run_dir, "system", f"system_{occupancy}.top")
+    output_top = os.path.join(run_dir, "system", f"system_{tag}.top")
     with open(output_top, 'w') as f:
         f.write(top_content)
     
@@ -327,6 +459,29 @@ def main():
         default="low",
         help="Peptide occupancy level (default: low)"
     )
+    parser.add_argument(
+        "--n-peptides",
+        type=int,
+        help="Override number of peptides to insert (e.g., 1 for single peptide)"
+    )
+    parser.add_argument(
+        "--placement",
+        choices=["poisson", "grid"],
+        default="poisson",
+        help="XY-Platzierung: 'poisson' (min spacing) oder 'grid'"
+    )
+    parser.add_argument(
+        "--orientation",
+        choices=["random", "parallel", "tilt45", "perpendicular"],
+        default="random",
+        help="Orientierungspool: parallel / 45° / senkrecht / random"
+    )
+    parser.add_argument(
+        "--replicates",
+        type=int,
+        default=1,
+        help="Anzahl unabhängiger Replikate (separate Systeme mit unterschiedlichen Seeds)"
+    )
     
     args = parser.parse_args()
     
@@ -336,7 +491,14 @@ def main():
         sys.exit(1)
     
     # Insert peptides
-    system_gro, system_top = insert_peptides(args.run_dir, args.occupancy)
+    system_gro, system_top = insert_peptides(
+        args.run_dir,
+        args.occupancy,
+        n_peptides_override=args.n_peptides,
+        placement=args.placement,
+        orientation=args.orientation,
+        replicates=args.replicates
+    )
     
     print(f"\nNext step: Equilibrate system")
     print(f"Command: python 06_equilibrate.py {args.run_dir} --occupancy {args.occupancy}")

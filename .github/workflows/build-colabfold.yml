@@ -4,7 +4,7 @@ on:
   push:
     branches: [ main, master ]
     paths:
-      - 'docker/Dockerfile'
+      - 'docker/Dockerfile.colabfold'
       - '.github/workflows/build-colabfold.yml'
       - 'docker-compose.yml'
   workflow_dispatch: {}
@@ -41,6 +41,6 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: ./docker
-          file: ./docker/Dockerfile
+          file: ./docker/Dockerfile.colabfold
           push: true
           tags: ${{ env.IMAGE_NAME }}

@@ -59,7 +59,7 @@ def run_martinize2(run_dir):
         return output_pdb, output_top
     
     # Build Martinize2 command
-    cmd = [
+    base_cmd = [
         "martinize2",
         "-f", pdb_path,
         "-o", output_top,
@@ -73,9 +73,10 @@ def run_martinize2(run_dir):
     
     # Add C-terminal modification (always amidated for AMPs)
     if config['coarse_graining']['c_terminal']:
-        cmd.extend(["-cter", config['coarse_graining']['c_terminal']])
+        base_cmd.extend(["-cter", config['coarse_graining']['c_terminal']])
     
     # Use DSSP for secondary structure
+    cmd = list(base_cmd)
     if config['coarse_graining']['dssp']:
         cmd.append("-dssp")
     
@@ -90,22 +91,28 @@ def run_martinize2(run_dir):
     print(f"Running Martinize2 for {metadata['peptide_id']}...")
     print(f"Command: {' '.join(cmd)}")
     
-    # Run Martinize2
+    # Run Martinize2 with optional DSSP, fallback without DSSP if it fails
     with open(log_file, 'w') as log:
-        try:
+        def run_and_log(run_cmd):
             result = subprocess.run(
-                cmd,
+                run_cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                text=True,
-                check=True
+                text=True
             )
             log.write(result.stdout)
-            print("✓ Martinize2 completed successfully")
-        except subprocess.CalledProcessError as e:
-            log.write(e.stdout if e.stdout else "")
+            return result.returncode, result.stdout
+
+        rc, out = run_and_log(cmd)
+        if rc != 0 and config['coarse_graining']['dssp']:
+            print("! DSSP run failed, retrying without DSSP...")
+            cmd_no_dssp = list(base_cmd)
+            print(f"Command: {' '.join(cmd_no_dssp)}")
+            rc, out = run_and_log(cmd_no_dssp)
+        if rc != 0:
             print(f"✗ Martinize2 failed. Check log: {log_file}")
             sys.exit(1)
+        print("✓ Martinize2 completed successfully")
     
     # Extract secondary structure from log
     extract_secondary_structure(log_file, output_dir, metadata['peptide_id'])

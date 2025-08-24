@@ -11,8 +11,8 @@ project:
 directories:
   simulations_base: "/home/michelhuller/solvia/simulations"
   data_base: "/home/michelhuller/solvia/data"
-  templates: "/home/michelhuller/solvia/data/templates"
-  force_fields: "/home/michelhuller/solvia/force_fields"
+  templates: "/work/data/templates"
+  force_fields: "/work/force_fields"
   scripts: "/home/michelhuller/solvia/scripts/universal"
 
 # ColabFold parameters
@@ -28,7 +28,7 @@ colabfold:
 coarse_graining:
   force_field: "martini3001"
   c_terminal: "NH2-ter"  # Amidated C-terminus
-  dssp: true  # Use DSSP for secondary structure
+  dssp: true  # Use DSSP for secondary structure (installed in martinize image)
   elastic_network: false
   position_restraints: true
   restraint_force: 1000

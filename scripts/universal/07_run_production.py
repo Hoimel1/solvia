@@ -96,7 +96,7 @@ constraints             = none
     
     return mdp_file, nsteps
 
-def run_production(run_dir, occupancy="low", time_ns=None, gpu=True):
+def run_production(run_dir, occupancy="low", time_ns=None, gpu=True, tag: str | None = None):
     """Run production simulation"""
     config = load_config()
     metadata = load_run_metadata(run_dir)
@@ -117,7 +117,8 @@ def run_production(run_dir, occupancy="low", time_ns=None, gpu=True):
     # Input files
     npt_gro = os.path.join(run_dir, equil_data['final_structure'])
     npt_cpt = os.path.join(run_dir, equil_data['final_checkpoint'])
-    system_top = os.path.join(run_dir, "system", f"system_{occupancy}.top")
+    use_tag = tag if tag else occupancy
+    system_top = os.path.join(run_dir, "system", f"system_{use_tag}.top")
     
     # Output directory
     prod_dir = os.path.join(run_dir, "production")
@@ -162,7 +163,7 @@ def run_production(run_dir, occupancy="low", time_ns=None, gpu=True):
     print(f"\n{'='*60}")
     print(f"Starting production simulation:")
     print(f"  Peptide: {metadata['peptide_id']}")
-    print(f"  Occupancy: {occupancy}")
+    print(f"  System tag: {use_tag}")
     print(f"  Duration: {time_ns or config['simulation']['production']['time']} ns ({nsteps:,} steps)")
     print(f"  Output every: {config['simulation']['production']['output_frequency']} ps")
     print(f"  GPU acceleration: {'Enabled' if gpu and config['performance']['gpu'] else 'Disabled'}")
@@ -182,25 +183,23 @@ def run_production(run_dir, occupancy="low", time_ns=None, gpu=True):
     with open(status_file, 'w') as f:
         yaml.dump(status, f, default_flow_style=False)
     
-    # Run simulation
+    # Run simulation in foreground and stream output to terminal and log
     print("Starting mdrun...")
     print(f"Command: {' '.join(mdrun_cmd)}")
-    print("\nThis will take several hours. Monitor progress with:")
-    print(f"  tail -f {prod_dir}/production.log")
-    print(f"  gmx check -f {prod_dir}/production.xtc")
-    
-    # Run in background or foreground based on time
-    if (time_ns or config['simulation']['production']['time']) > 10:
-        # Long simulations run in background
-        log_file = os.path.join(prod_dir, "production.log")
-        with open(log_file, 'w') as log:
-            process = subprocess.Popen(mdrun_cmd, stdout=log, stderr=subprocess.STDOUT)
-            print(f"\nSimulation running in background (PID: {process.pid})")
-            print(f"Log file: {log_file}")
-    else:
-        # Short simulations run in foreground
-        result = subprocess.run(mdrun_cmd)
-        if result.returncode != 0:
+    print("\nOutput is streamed below and also written to production.log")
+    log_file = os.path.join(prod_dir, "production.log")
+    with open(log_file, 'w') as log:
+        process = subprocess.Popen(mdrun_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+        try:
+            for line in process.stdout:
+                sys.stdout.write(line)
+                sys.stdout.flush()
+                log.write(line)
+                log.flush()
+        finally:
+            process.stdout.close()
+            ret = process.wait()
+        if ret != 0:
             print("Production simulation failed")
             status['status'] = 'failed'
         else:
@@ -229,6 +228,10 @@ def main():
         help="Peptide occupancy level (default: low)"
     )
     parser.add_argument(
+        "--tag",
+        help="Custom system tag to select system_*.top (e.g., n1_rep1)"
+    )
+    parser.add_argument(
         "--time",
         type=float,
         help="Simulation time in nanoseconds (default: from config)"
@@ -251,7 +254,8 @@ def main():
         args.run_dir, 
         args.occupancy, 
         args.time,
-        gpu=not args.no_gpu
+        gpu=not args.no_gpu,
+        tag=args.tag
     )
     
     print(f"\nWhen simulation completes:")

@@ -219,14 +219,15 @@ def run_mdrun(tpr_file, output_prefix, nt=None):
         return False
     return True
 
-def equilibrate_system(run_dir, occupancy="low"):
+def equilibrate_system(run_dir, occupancy="low", tag: str | None = None):
     """Run complete equilibration workflow"""
     config = load_config()
     metadata = load_run_metadata(run_dir)
     
-    # Input files
-    system_gro = os.path.join(run_dir, "system", f"system_{occupancy}.gro")
-    system_top = os.path.join(run_dir, "system", f"system_{occupancy}.top")
+    # Input files (support custom tag for replicates, e.g. n1_rep1)
+    use_tag = tag if tag else occupancy
+    system_gro = os.path.join(run_dir, "system", f"system_{use_tag}.gro")
+    system_top = os.path.join(run_dir, "system", f"system_{use_tag}.top")
     
     if not os.path.exists(system_gro):
         print(f"Error: System file not found: {system_gro}")
@@ -311,12 +312,12 @@ def equilibrate_system(run_dir, occupancy="low"):
         print("✗ NPT equilibration output not found")
         sys.exit(1)
     
-    print(f"\n✓ Equilibration complete for {metadata['peptide_id']} ({occupancy} occupancy)")
+    print(f"\n✓ Equilibration complete for {metadata['peptide_id']} ({use_tag})")
     
     # Save equilibration summary
     summary = {
         'peptide_id': metadata['peptide_id'],
-        'occupancy': occupancy,
+        'tag': use_tag,
         'em_completed': os.path.exists(em_gro),
         'nvt_completed': os.path.exists(nvt_gro),
         'npt_completed': os.path.exists(npt_gro),
@@ -343,6 +344,10 @@ def main():
         default="low",
         help="Peptide occupancy level (default: low)"
     )
+    parser.add_argument(
+        "--tag",
+        help="Custom system tag, e.g. n1_rep1 (overrides occupancy-based filenames)"
+    )
     
     args = parser.parse_args()
     
@@ -352,10 +357,11 @@ def main():
         sys.exit(1)
     
     # Run equilibration
-    final_gro = equilibrate_system(args.run_dir, args.occupancy)
+    final_gro = equilibrate_system(args.run_dir, args.occupancy, tag=args.tag)
     
+    next_tag = args.tag if args.tag else args.occupancy
     print(f"\nNext step: Run production simulation")
-    print(f"Command: python 07_run_production.py {args.run_dir} --occupancy {args.occupancy}")
+    print(f"Command: python 07_run_production.py {args.run_dir} --tag {next_tag}")
 
 if __name__ == "__main__":
     main()

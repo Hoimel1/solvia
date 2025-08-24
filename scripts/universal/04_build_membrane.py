@@ -8,6 +8,7 @@ import os
 import sys
 import yaml
 import argparse
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -22,14 +23,8 @@ def build_membrane_template(config):
     # Get membrane parameters from config
     membrane_config = config['membrane']
     
-    # Build INSANE command
-    # Use INSANE from venv
-    venv_path = Path(__file__).parent.parent.parent / "venv" / "bin" / "insane"
-    if venv_path.exists():
-        insane_cmd = str(venv_path)
-    else:
-        # Fallback to system insane
-        insane_cmd = "insane"
+    # Build INSANE command: always use container PATH (ignore host venv)
+    insane_cmd = shutil.which("insane") or "insane"
     
     # Format box size as single string
     box_str = f"{membrane_config['box_size'][0]},{membrane_config['box_size'][1]},{membrane_config['box_size'][2]}"
@@ -60,14 +55,19 @@ def build_membrane_template(config):
 def run_insane(run_dir):
     """Run INSANE to create membrane template"""
     config = load_config()
+    original_dir = os.getcwd()
     
     # Output directory
     if run_dir:
-        output_dir = os.path.join(run_dir, "membrane_template")
+        run_dir_abs = os.path.abspath(run_dir)
+        output_dir = os.path.join(run_dir_abs, "membrane_template")
     else:
         # Create global template
-        output_dir = os.path.join(config['directories']['templates'], "membrane")
+        templates_base = os.path.abspath(config['directories']['templates'])
+        output_dir = os.path.join(templates_base, "membrane")
         os.makedirs(output_dir, exist_ok=True)
+    # Ensure output directory exists for run-specific builds
+    os.makedirs(output_dir, exist_ok=True)
     
     # Check if already exists
     gro_file = os.path.join(output_dir, "membrane_template.gro")
@@ -82,9 +82,12 @@ def run_insane(run_dir):
     
     # Log file
     if run_dir:
-        log_file = os.path.join(run_dir, "logs", "insane_membrane.log")
+        log_file = os.path.join(run_dir_abs, "logs", "insane_membrane.log")
     else:
         log_file = os.path.join(output_dir, "insane_membrane.log")
+    # Ensure logs directory exists for run-specific builds
+    if run_dir:
+        os.makedirs(os.path.join(run_dir_abs, "logs"), exist_ok=True)
     
     print("Building RBC membrane template with INSANE...")
     print(f"Upper leaflet: {upper_str}")
@@ -93,7 +96,6 @@ def run_insane(run_dir):
     print(f"Salt: {config['membrane']['salt_concentration']} M")
     
     # Change to output directory
-    original_dir = os.getcwd()
     os.chdir(output_dir)
     
     # Run INSANE

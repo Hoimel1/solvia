@@ -1,0 +1,27 @@
+# SOLVIA custom martinize2 (vermouth) image with conda (mdtraj + DSSP)
+FROM condaforge/miniforge3:24.7.1-0
+
+SHELL ["/bin/bash", "-lc"]
+
+RUN conda install -y -c conda-forge \
+      python=3.10 \
+      mdtraj=1.9.9 \
+      dssp \
+      pip && \
+    conda clean -afy
+
+RUN pip install --upgrade pip
+
+# martinize2 comes with vermouth
+RUN pip install \
+      "vermouth" \
+      biopython==1.81 \
+      numpy==1.24.3 \
+      PyYAML==6.0.1
+
+# Provide a compatibility wrapper so vermouth's dssp call works with mkdssp and version check
+RUN printf '#!/bin/bash\nset -e\nif [[ "$1" == "--version" ]]; then echo "DSSP 3.0.0"; exit 0; fi\nEXE=mkdssp\nfor a in "$@"; do if [[ -f "$a" ]]; then exec "$EXE" -i "$a" -o /dev/stdout; fi; done\nexec "$EXE" "$@"\n' > /usr/local/bin/dssp && chmod +x /usr/local/bin/dssp
+
+WORKDIR /work
+
+ENTRYPOINT ["martinize2"]

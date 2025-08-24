@@ -1,25 +1,30 @@
 # SOLVIA custom ColabFold GPU image
 # Base: NVIDIA CUDA Runtime for GPU support
-FROM nvidia/cuda:12.2.0-runtime-ubuntu22.04
+FROM nvidia/cuda:11.8.0-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
 # System packages
 RUN apt-get update && apt-get install -y \
-    python3 python3-pip git wget curl build-essential \
+    python3 python3-pip git wget curl build-essential kalign \
     && rm -rf /var/lib/apt/lists/*
 
 # Python upgrade
 RUN python3 -m pip install --upgrade pip
 
 # Core Python deps pinned for stability
-RUN pip install \
-    "colabfold==1.5.5" \
-    "jax[cuda12_local]==0.4.31" \
-    "jaxlib==0.4.31" \
+RUN pip install --no-cache-dir \
+    "colabfold[alphafold]==1.5.5" \
     biopython==1.81 \
     numpy==1.24.3 \
-    PyYAML==6.0.1
+    PyYAML==6.0.1 \
+    dm-haiku>=0.0.12 \
+    chex>=0.1.86
+
+# Install JAX/JAXLIB CUDA 11.8 wheels
+RUN pip install --no-cache-dir --upgrade \
+    "jax[cuda11_local]==0.4.26" \
+    -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
 
 # Workdir
 WORKDIR /work
