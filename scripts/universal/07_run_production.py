@@ -127,29 +127,43 @@ def run_production(run_dir, occupancy="low", time_ns=None, gpu=True, tag: str | 
     print(f"Setting up production run...")
     mdp_file, nsteps = create_production_mdp(run_dir, config, time_ns)
     
-    # Run grompp
+    # Run grompp via Docker
     tpr_file = os.path.join(prod_dir, "production.tpr")
+    
+    # Get relative paths from project root
+    from pathlib import Path
+    project_root = Path(__file__).parent.parent.parent
+    rel_mdp = os.path.relpath(mdp_file, project_root)
+    rel_npt = os.path.relpath(npt_gro, project_root)
+    rel_top = os.path.relpath(system_top, project_root)
+    rel_tpr = os.path.relpath(tpr_file, project_root)
+    rel_cpt = os.path.relpath(npt_cpt, project_root)
+    
     cmd = [
-        "gmx", "grompp",
-        "-f", mdp_file,
-        "-c", npt_gro,
-        "-t", npt_cpt,
-        "-p", system_top,
-        "-o", tpr_file,
+        "docker", "compose", "run", "--rm", "gromacs",
+        "grompp",  # Docker already provides "gmx"
+        "-f", f"/work/{rel_mdp}",
+        "-c", f"/work/{rel_npt}",
+        "-t", f"/work/{rel_cpt}",
+        "-p", f"/work/{rel_top}",
+        "-o", f"/work/{rel_tpr}",
         "-maxwarn", "2"
     ]
     
-    print("Running grompp...")
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    print("Running grompp via Docker...")
+    result = subprocess.run(cmd, capture_output=True, text=True, cwd=str(project_root))
     if result.returncode != 0:
         print(f"GROMPP Error:\n{result.stderr}")
         sys.exit(1)
     
-    # Prepare mdrun command
+    # Prepare mdrun command via Docker
+    rel_deffnm = os.path.relpath(os.path.join(prod_dir, "production"), project_root)
+    
     mdrun_cmd = [
-        "gmx", "mdrun",
+        "docker", "compose", "run", "--rm", "gromacs",
+        "mdrun",  # Docker already provides "gmx"
         "-v",
-        "-deffnm", os.path.join(prod_dir, "production")
+        "-deffnm", f"/work/{rel_deffnm}"
     ]
     
     # Use GPU if available and requested
@@ -184,12 +198,12 @@ def run_production(run_dir, occupancy="low", time_ns=None, gpu=True, tag: str | 
         yaml.dump(status, f, default_flow_style=False)
     
     # Run simulation in foreground and stream output to terminal and log
-    print("Starting mdrun...")
+    print("Starting mdrun via Docker...")
     print(f"Command: {' '.join(mdrun_cmd)}")
     print("\nOutput is streamed below and also written to production.log")
     log_file = os.path.join(prod_dir, "production.log")
     with open(log_file, 'w') as log:
-        process = subprocess.Popen(mdrun_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+        process = subprocess.Popen(mdrun_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, cwd=str(project_root))
         try:
             for line in process.stdout:
                 sys.stdout.write(line)

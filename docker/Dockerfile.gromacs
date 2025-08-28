@@ -44,7 +44,7 @@ RUN wget -q https://ftp.gromacs.org/gromacs/gromacs-${GMX_VERSION}.tar.gz && \
 ENV PATH=/usr/local/gromacs/bin:$PATH
 
 # Python dependencies for control scripts
-RUN pip3 install --no-cache-dir numpy==1.24.3 PyYAML==6.0.1
+RUN pip3 install --no-cache-dir numpy==1.24.3 PyYAML==6.0.1 scipy pymbar==3.0.5
 
 WORKDIR /work
 

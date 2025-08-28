@@ -181,39 +181,63 @@ constraints             = none
 
 def run_grompp(mdp_file, coord_file, top_file, output_tpr, 
                ref_file=None, cpt_file=None, maxwarn=2):
-    """Run GROMACS grompp"""
+    """Run GROMACS grompp via Docker"""
+    from pathlib import Path
+    
+    # Get relative paths from project root
+    project_root = Path(__file__).parent.parent.parent
+    rel_mdp = os.path.relpath(mdp_file, project_root)
+    rel_coord = os.path.relpath(coord_file, project_root)
+    rel_top = os.path.relpath(top_file, project_root)
+    rel_tpr = os.path.relpath(output_tpr, project_root)
+    
+    # Build Docker command (gromacs container has ENTRYPOINT ["gmx"])
     cmd = [
-        "gmx", "grompp",
-        "-f", mdp_file,
-        "-c", coord_file,
-        "-p", top_file,
-        "-o", output_tpr,
+        "docker", "compose", "run", "--rm", "gromacs",
+        "grompp",  # Just the subcommand - Docker already provides "gmx"
+        "-f", f"/work/{rel_mdp}",
+        "-c", f"/work/{rel_coord}",
+        "-p", f"/work/{rel_top}",
+        "-o", f"/work/{rel_tpr}",
         "-maxwarn", str(maxwarn)
     ]
     
     if ref_file:
-        cmd.extend(["-r", ref_file])
+        rel_ref = os.path.relpath(ref_file, project_root)
+        cmd.extend(["-r", f"/work/{rel_ref}"])
     if cpt_file and os.path.exists(cpt_file):
-        cmd.extend(["-t", cpt_file])
+        rel_cpt = os.path.relpath(cpt_file, project_root)
+        cmd.extend(["-t", f"/work/{rel_cpt}"])
     
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    # Run from project root (where docker-compose.yml is)
+    result = subprocess.run(cmd, capture_output=True, text=True, cwd=str(project_root))
     if result.returncode != 0:
         print(f"GROMPP Error:\n{result.stderr}")
         return False
     return True
 
 def run_mdrun(tpr_file, output_prefix, nt=None):
-    """Run GROMACS mdrun"""
+    """Run GROMACS mdrun via Docker"""
+    from pathlib import Path
+    
+    # Get relative paths from project root
+    project_root = Path(__file__).parent.parent.parent
+    rel_tpr = os.path.relpath(tpr_file, project_root)
+    rel_prefix = os.path.relpath(output_prefix, project_root)
+    
+    # Build Docker command (gromacs container has ENTRYPOINT ["gmx"])
     cmd = [
-        "gmx", "mdrun",
+        "docker", "compose", "run", "--rm", "gromacs",
+        "mdrun",  # Just the subcommand - Docker already provides "gmx"
         "-v",
-        "-deffnm", output_prefix
+        "-deffnm", f"/work/{rel_prefix}"
     ]
     
     if nt:
         cmd.extend(["-nt", str(nt)])
     
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    # Run from project root (where docker-compose.yml is)
+    result = subprocess.run(cmd, capture_output=True, text=True, cwd=str(project_root))
     if result.returncode != 0:
         print(f"MDRUN Error:\n{result.stderr}")
         return False
@@ -226,12 +250,29 @@ def equilibrate_system(run_dir, occupancy="low", tag: str | None = None):
     
     # Input files (support custom tag for replicates, e.g. n1_rep1)
     use_tag = tag if tag else occupancy
-    system_gro = os.path.join(run_dir, "system", f"system_{use_tag}.gro")
-    system_top = os.path.join(run_dir, "system", f"system_{use_tag}.top")
+    system_dir = os.path.join(run_dir, "system")
+    system_gro = os.path.join(system_dir, f"system_{use_tag}.gro")
+    system_top = os.path.join(system_dir, f"system_{use_tag}.top")
+    
+    # If not found, try to find any system file
+    if not os.path.exists(system_gro):
+        # Look for any system_*.gro file
+        import glob
+        system_files = glob.glob(os.path.join(system_dir, "system_*.gro"))
+        if system_files:
+            # Use the first (or most recent) system file found
+            system_gro = system_files[0]
+            basename = os.path.basename(system_gro)
+            use_tag = basename.replace("system_", "").replace(".gro", "")
+            system_top = os.path.join(system_dir, f"system_{use_tag}.top")
+            print(f"Using system file: {basename}")
+        else:
+            print(f"Error: No system files found in {system_dir}")
+            print("Run peptide insertion first: python 05_insert_peptides.py")
+            sys.exit(1)
     
     if not os.path.exists(system_gro):
         print(f"Error: System file not found: {system_gro}")
-        print("Run peptide insertion first: python 05_insert_peptides.py")
         sys.exit(1)
     
     # Create MDP files
@@ -240,15 +281,16 @@ def equilibrate_system(run_dir, occupancy="low", tag: str | None = None):
     # Energy minimization
     print("\n=== Energy Minimization ===")
     em_dir = os.path.join(run_dir, "equilibration", "em")
+    os.makedirs(em_dir, exist_ok=True)  # Ensure directory exists
     em_mdp = os.path.join(mdp_dir, "em.mdp")
     em_tpr = os.path.join(em_dir, "em.tpr")
     
-    print("Running grompp...")
+    print("Running grompp via Docker...")
     if not run_grompp(em_mdp, system_gro, system_top, em_tpr, ref_file=system_gro):
         print("EM grompp failed")
         sys.exit(1)
     
-    print("Running energy minimization...")
+    print("Running energy minimization via Docker...")
     if not run_mdrun(em_tpr, os.path.join(em_dir, "em"), 
                      config['performance']['cpu_threads']):
         print("Energy minimization failed")
@@ -265,15 +307,16 @@ def equilibrate_system(run_dir, occupancy="low", tag: str | None = None):
     # NVT equilibration
     print("\n=== NVT Equilibration ===")
     nvt_dir = os.path.join(run_dir, "equilibration", "nvt")
+    os.makedirs(nvt_dir, exist_ok=True)  # Ensure directory exists
     nvt_mdp = os.path.join(mdp_dir, "nvt.mdp")
     nvt_tpr = os.path.join(nvt_dir, "nvt.tpr")
     
-    print("Running grompp...")
+    print("Running grompp via Docker...")
     if not run_grompp(nvt_mdp, em_gro, system_top, nvt_tpr, ref_file=em_gro):
         print("NVT grompp failed")
         sys.exit(1)
     
-    print(f"Running NVT equilibration ({config['simulation']['nvt']['time']} ps)...")
+    print(f"Running NVT equilibration via Docker ({config['simulation']['nvt']['time']} ps)...")
     if not run_mdrun(nvt_tpr, os.path.join(nvt_dir, "nvt"),
                      config['performance']['cpu_threads']):
         print("NVT equilibration failed")
@@ -290,16 +333,17 @@ def equilibrate_system(run_dir, occupancy="low", tag: str | None = None):
     # NPT equilibration
     print("\n=== NPT Equilibration ===")
     npt_dir = os.path.join(run_dir, "equilibration", "npt")
+    os.makedirs(npt_dir, exist_ok=True)  # Ensure directory exists
     npt_mdp = os.path.join(mdp_dir, "npt.mdp")
     npt_tpr = os.path.join(npt_dir, "npt.tpr")
     
-    print("Running grompp...")
+    print("Running grompp via Docker...")
     if not run_grompp(npt_mdp, nvt_gro, system_top, npt_tpr, 
                       ref_file=nvt_gro, cpt_file=nvt_cpt):
         print("NPT grompp failed")
         sys.exit(1)
     
-    print(f"Running NPT equilibration ({config['simulation']['npt']['time']} ps)...")
+    print(f"Running NPT equilibration via Docker ({config['simulation']['npt']['time']} ps)...")
     if not run_mdrun(npt_tpr, os.path.join(npt_dir, "npt"),
                      config['performance']['cpu_threads']):
         print("NPT equilibration failed")

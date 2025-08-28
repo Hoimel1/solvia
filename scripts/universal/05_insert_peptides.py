@@ -206,7 +206,7 @@ def insert_peptides(run_dir, occupancy="low", n_peptides_override=None, placemen
         occupancy_label = occupancy
     
     # Input files
-    peptide_gro = os.path.join(run_dir, "cg_pdb", f"{metadata['peptide_id']}_cg.pdb")
+    peptide_gro = os.path.join(run_dir, "coarse_grain", f"{metadata['peptide_id']}_cg.pdb")
     membrane_gro = os.path.join(run_dir, "membrane_template", "membrane_template.gro")
     
     # Check if membrane exists, if not create it
@@ -391,7 +391,7 @@ def create_system_topology(run_dir, peptide_id, n_peptides, tag):
                         membrane_molecules.append((mol_name, int(mol_count)))
     
     # Determine peptide moleculetype name from ITP
-    peptide_itp = os.path.join(run_dir, "cg_pdb", f"{peptide_id}.itp")
+    peptide_itp = os.path.join(run_dir, "coarse_grain", f"{peptide_id}.itp")
     peptide_moltype = peptide_id
     try:
         with open(peptide_itp, 'r') as f:
@@ -424,7 +424,7 @@ def create_system_topology(run_dir, peptide_id, n_peptides, tag):
 #include "{config['directories']['force_fields']}/martini_v3.0.0_ions_v1.itp"
 
 ; Include peptide topology
-#include "../cg_pdb/{peptide_id}.itp"
+#include "../coarse_grain/{peptide_id}.itp"
 
 [ system ]
 {n_peptides} {peptide_id} peptides in RBC membrane
@@ -501,7 +501,12 @@ def main():
     )
     
     print(f"\nNext step: Equilibrate system")
-    print(f"Command: python 06_equilibrate.py {args.run_dir} --occupancy {args.occupancy}")
+    # Determine the correct tag for the equilibration command
+    if args.n_peptides is not None and args.n_peptides > 0:
+        eq_tag = f"--tag n{args.n_peptides}"
+    else:
+        eq_tag = f"--occupancy {args.occupancy}"
+    print(f"Command: python 06_equilibrate.py {args.run_dir} {eq_tag}")
 
 if __name__ == "__main__":
     main()

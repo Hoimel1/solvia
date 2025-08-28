@@ -107,3 +107,34 @@ performance:
   cpu_threads: 8
   gpu: true
   max_warnings: 2
+  # Optional: Override GROMACS binary name (e.g., gmx_mpi on HPC clusters)
+  gmx_cmd: "gmx"
+
+pmf:
+  strategy: variable            # uniform | variable | condensed
+  spring_k: 700                 # kJ/mol/nm^2
+  time_per_window_ns: 15
+  # Headgroup atom names used to define membrane planes (upper/lower)
+  # For Martini CG typically ["PO4"], for some AA force fields ["P"] may be used
+  plane_atom_names: ["PO4", "P"]
+  # Optional: Tuning der variablen Gitter-Erzeugung
+  bulk_max_nm: 2.4
+  bulk_min_nm: 2.2
+  bulk_extra_nm: 2.6            # optional zusätzliches Bulk-Fenster
+  dense_max_nm: 0.6
+  dense_min_nm: -0.6
+  dense_step_nm: 0.15
+  coarse_step_nm: 0.2
+  end_nm: -1.4
+  # Oder komplette manuelle Liste
+  # window_centers: [2.4, 2.2, 2.0, 1.8, ... , -1.4]
+  
+  # Optional: Robustere Peptid-Erkennung (falls unübliche Residue-/Atomnamen)
+  # Wenn gesetzt, überschreibt die Heuristik komplett bzw. wird zuerst versucht
+  # peptide_resnames: ["PEP", "PPT"]        # Liste von Residue-Namen (case-insensitive)
+  # peptide_resname_regex: "^PEP.*$"         # Regex auf Residue-Namen
+  # peptide_atomnames: ["BB", "SC1"]        # Liste von Atomnamen, falls CG-Mappings genutzt werden
+  # exclude_resnames: ["SOL", "NA", "CL"]  # Zusätzliche auszuschließende Klassen (Wasser/Ionen/Lipide)
+  # lipid_resnames: ["POPC", "POPE", "POPS", "CHOL", "PSM"]
+  # peptide_min_atoms: 5
+  # peptide_max_atoms: 5000

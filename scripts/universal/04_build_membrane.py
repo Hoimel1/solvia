@@ -18,21 +18,23 @@ def load_config():
     with open(config_path, 'r') as f:
         return yaml.safe_load(f)
 
-def build_membrane_template(config):
-    """Build RBC membrane template using INSANE"""
+def build_membrane_template(config, output_dir):
+    """Build RBC membrane template using INSANE via Docker"""
     # Get membrane parameters from config
     membrane_config = config['membrane']
     
-    # Build INSANE command: always use container PATH (ignore host venv)
-    insane_cmd = shutil.which("insane") or "insane"
+    # Get relative path from project root
+    project_root = Path(__file__).parent.parent.parent
+    rel_output_dir = os.path.relpath(output_dir, project_root)
     
     # Format box size as single string
     box_str = f"{membrane_config['box_size'][0]},{membrane_config['box_size'][1]},{membrane_config['box_size'][2]}"
     
+    # Build Docker command for INSANE
     cmd = [
-        insane_cmd,
-        "-o", "membrane_template.gro",
-        "-p", "membrane_template.top",
+        "docker", "compose", "run", "--rm", "insane",
+        "-o", f"/work/{rel_output_dir}/membrane_template.gro",
+        "-p", f"/work/{rel_output_dir}/membrane_template.top",
         "-box", box_str,
         "-sol", membrane_config['solvent'],
         "-salt", str(membrane_config['salt_concentration'])
@@ -62,9 +64,11 @@ def run_insane(run_dir):
         run_dir_abs = os.path.abspath(run_dir)
         output_dir = os.path.join(run_dir_abs, "membrane_template")
     else:
-        # Create global template
-        templates_base = os.path.abspath(config['directories']['templates'])
-        output_dir = os.path.join(templates_base, "membrane")
+        # Create global template - use project's data/templates directory
+        project_root = Path(__file__).parent.parent.parent
+        templates_base = project_root / "data" / "templates"
+        output_dir = templates_base / "membrane"
+        output_dir = str(output_dir)  # Convert to string for os.path operations
         os.makedirs(output_dir, exist_ok=True)
     # Ensure output directory exists for run-specific builds
     os.makedirs(output_dir, exist_ok=True)
@@ -78,7 +82,7 @@ def run_insane(run_dir):
         return gro_file, top_file
     
     # Build command
-    cmd, upper_str, lower_str = build_membrane_template(config)
+    cmd, upper_str, lower_str = build_membrane_template(config, output_dir)
     
     # Log file
     if run_dir:
@@ -89,16 +93,16 @@ def run_insane(run_dir):
     if run_dir:
         os.makedirs(os.path.join(run_dir_abs, "logs"), exist_ok=True)
     
-    print("Building RBC membrane template with INSANE...")
+    print("Building RBC membrane template with INSANE via Docker...")
     print(f"Upper leaflet: {upper_str}")
     print(f"Lower leaflet: {lower_str}")
     print(f"Box size: {' x '.join(map(str, config['membrane']['box_size']))} nm")
     print(f"Salt: {config['membrane']['salt_concentration']} M")
     
-    # Change to output directory
-    os.chdir(output_dir)
+    # Run INSANE from project root (Docker needs docker-compose.yml)
+    project_root = Path(__file__).parent.parent.parent
     
-    # Run INSANE
+    # Run INSANE via Docker
     with open(log_file, 'w') as log:
         try:
             result = subprocess.run(
@@ -106,6 +110,7 @@ def run_insane(run_dir):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
+                cwd=str(project_root),  # Run from project root
                 check=True
             )
             log.write(result.stdout)
@@ -113,10 +118,7 @@ def run_insane(run_dir):
         except subprocess.CalledProcessError as e:
             log.write(e.stdout if e.stdout else "")
             print(f"✗ INSANE failed. Check log: {log_file}")
-            os.chdir(original_dir)
             sys.exit(1)
-    
-    os.chdir(original_dir)
     
     # Parse membrane composition from log
     parse_membrane_composition(log_file, output_dir)

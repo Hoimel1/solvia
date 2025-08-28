@@ -1,0 +1,110 @@
+# PMF Standard Configuration for Toxprediction Engine
+# Evidence-based parameters for robust PMF calculations
+
+pmf:
+  # Standardized membrane setup
+  membrane:
+    type: "standard_rbc"
+    cholesterol_percentage: 45  # Fixed for RBC membrane
+    box_size: [10, 10, 14]     # nm
+    
+    # Fixed outer leaflet composition (no variation)
+    outer_leaflet:
+      POPC: 0.40
+      PSM: 0.15
+      CHOL: 0.45
+    
+    # Fixed inner leaflet composition
+    inner_leaflet:
+      POPE: 0.45
+      POPS: 0.15
+      CHOL: 0.40
+  
+  # PMF calculation parameters (SOP from aenderungen.md)
+  umbrella:
+    # Reference mode
+    ref_mode: "patch"  # patch | global | plumed
+    patch_radius: 2.0  # nm around peptide COM
+    
+    # Window parameters
+    strategy: "adaptive"
+    force_constant: 900  # kJ/mol/nm^2 (can increase to 1100 if needed)
+    
+    # Z-range with adaptive spacing
+    z_range:
+      bulk_max: 2.8      # nm
+      bulk_min: 2.4      # nm
+      dense_max: 0.6     # nm
+      dense_min: -0.6    # nm
+      dense_step: 0.15   # nm
+      coarse_step: 0.2   # nm
+      end_z: -2.0        # nm (deeper than original -1.4)
+    
+    # Timing
+    pre_smd_ns: 5.0           # SMD ladder to pull peptide
+    pre_equil_ns: 1.0         # Pre-equilibration per window
+    production_ns: 20.0       # Production per window (extendable to 30)
+    
+    # Overlap control
+    target_overlap: 0.20      # Minimum neighbor overlap
+    auto_densify: true        # Add windows if overlap < target
+    
+    # Output
+    pull_output_ps: 1.0       # High resolution for QC
+  
+  # Replicate management
+  replicates:
+    n_replicates: 2
+    orientations:
+      - "parallel"    # R1: peptide parallel to membrane
+      - "tilted"      # R2: 30° tilt
+    deterministic_seeds: true  # Seeds from peptide ID + replicate
+  
+  # Quality control gates
+  qc:
+    enabled: true
+    
+    # Overlap requirements
+    min_neighbor_overlap: 0.10  # Hard minimum
+    target_overlap: 0.20         # For auto-densification
+    
+    # Convergence checks
+    min_ess_frames: 200          # Effective sample size
+    half_time_tolerance: 2.0     # kJ/mol difference between halves
+    
+    # Replicate consistency
+    replicate_tolerance: 2.0     # kJ/mol for ΔGads, ΔGinsert
+    
+    # Maximum resources
+    max_windows: 22              # Budget limit
+    max_time_per_window: 30      # ns
+    
+  # Analysis parameters
+  analysis:
+    method: "mbar"               # Primary method (mbar | wham)
+    bootstrap:
+      enabled: true
+      n_bootstrap: 1000
+      confidence_level: 0.95
+    
+    # Feature extraction
+    features:
+      - "delta_g_ads"          # ΔGads
+      - "delta_g_insert"       # ΔGinsert  
+      - "delta_g_barrier"      # ΔG‡
+      - "z_surf_min"           # Surface minimum position
+      - "z_head_min"           # Head group minimum
+      - "z_barrier"            # Barrier position
+    
+    # Smoothing
+    smoothing:
+      method: "pchip"          # Piecewise cubic hermite
+      grid_spacing: 0.01       # nm
+  
+  # Reporting
+  reporting:
+    generate_qc_report: true
+    plot_pmf: true
+    plot_overlaps: true
+    plot_convergence: true
+    save_raw_data: true

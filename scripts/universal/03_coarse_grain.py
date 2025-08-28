@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-SOLVIA Coarse-Graining with Martinize2
-Converts atomistic structure to Martini 3 coarse-grained representation
+SOLVIA Peptide Coarse-Graining
+Converts atomistic structures to Martini 3 coarse-grained representation
+Handles all ITP processing and symlink creation automatically
 """
 
 import os
@@ -9,6 +10,8 @@ import sys
 import yaml
 import argparse
 import subprocess
+import shutil
+import re
 from pathlib import Path
 
 def load_config():
@@ -24,199 +27,294 @@ def load_run_metadata(run_dir):
         return yaml.safe_load(f)
 
 def get_best_structure(run_dir):
-    """Get best structure from ColabFold"""
+    """Get best structure from ColabFold or other source"""
+    # Check for model selection file
     selection_file = os.path.join(run_dir, "colabfold", "model_selection.yaml")
     if not os.path.exists(selection_file):
-        print("Error: ColabFold model selection not found. Run 02_run_colabfold.py first.")
+        print("Error: No model selection found. Run ColabFold first.")
         sys.exit(1)
     
     with open(selection_file, 'r') as f:
         selection = yaml.safe_load(f)
     
-    pdb_path = os.path.join(run_dir, "colabfold", selection['best_pdb'])
+    # Use best_model (filename) or best_pdb (full path)
+    if 'best_model' in selection and selection['best_model']:
+        pdb_path = os.path.join(run_dir, "colabfold", selection['best_model'])
+    elif 'best_pdb' in selection:
+        # best_pdb might be a full path or relative path
+        if os.path.isabs(selection['best_pdb']):
+            pdb_path = selection['best_pdb']
+        else:
+            pdb_path = selection['best_pdb']
+    else:
+        print("Error: No best model found in selection file")
+        sys.exit(1)
+    
+    # Create best_model.pdb symlink for martinize
+    best_model_link = os.path.join(run_dir, "colabfold", "best_model.pdb")
+    if not os.path.exists(best_model_link):
+        os.symlink(os.path.basename(pdb_path), best_model_link)
+    
     if not os.path.exists(pdb_path):
         print(f"Error: PDB file not found: {pdb_path}")
         sys.exit(1)
     
-    return pdb_path, selection['best_plddt']
+    return pdb_path, selection.get('best_plddt', 80)
 
-def run_martinize2(run_dir):
-    """Run Martinize2 for coarse-graining"""
-    config = load_config()
-    metadata = load_run_metadata(run_dir)
+def extract_peptide_id(run_dir):
+    """Extract peptide ID from run directory name"""
+    run_dir_name = os.path.basename(run_dir)  # e.g., "solvia_1_run_1"
+    # Extract peptide_id: solvia_1_run_1 -> SOLVIA_1
+    parts = run_dir_name.split('_')
+    if len(parts) >= 2:
+        peptide_id = '_'.join(parts[:2]).upper()  # "SOLVIA_1"
+    else:
+        peptide_id = "PEPTIDE"
+    return peptide_id
+
+def run_martinize_docker(run_dir, pdb_path, config):
+    """Run Martinize via Docker and handle all ITP processing"""
+    print(f"\n{'='*50}")
+    print("Running Martinize via Docker...")
+    print(f"{'='*50}")
     
-    # Get input structure
-    pdb_path, plddt = get_best_structure(run_dir)
+    # Extract configuration
+    cg_config = config.get('coarse_graining', {})
+    c_terminal = cg_config.get('c_terminal', 'NH2-ter')
+    force_field = cg_config.get('force_field', 'martini3001')
     
-    # Output paths
-    output_dir = os.path.join(run_dir, "cg_pdb")
-    output_top = os.path.join(output_dir, f"{metadata['peptide_id']}.itp")
-    output_pdb = os.path.join(output_dir, f"{metadata['peptide_id']}_cg.pdb")
+    # Get peptide ID
+    peptide_id = extract_peptide_id(run_dir)
     
-    # Check if already done
-    if os.path.exists(output_top) and os.path.exists(output_pdb):
-        print("Coarse-graining already completed.")
-        return output_pdb, output_top
+    # Get relative path from project root
+    project_root = Path(__file__).parent.parent.parent
+    rel_run_dir = os.path.relpath(run_dir, project_root)
     
-    # Build Martinize2 command
-    base_cmd = [
-        "martinize2",
-        "-f", pdb_path,
-        "-o", output_top,
-        "-x", output_pdb,
-        "-ff", config['coarse_graining']['force_field'],
-        "-name", metadata['peptide_id'],
-        "-maxwarn", "10",
-        "-p", "backbone",
-        "-pf", str(config['coarse_graining']['restraint_force']),
+    # Create output directory
+    output_dir = os.path.join(run_dir, "coarse_grain")
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Build Docker command
+    cmd = [
+        'docker', 'compose', 'run', '--rm', 'martinize',
+        '-f', f'/work/{rel_run_dir}/colabfold/best_model.pdb',
+        '-ff', force_field,
+        '-x', f'/work/{rel_run_dir}/coarse_grain/{peptide_id}_cg.pdb',
+        '-o', f'/work/{rel_run_dir}/coarse_grain/{peptide_id}.itp',
+        '-name', peptide_id,
+        '-cter', c_terminal,  # C-terminal amidation
+        '-dssp',               # Use DSSP for secondary structure
+        '-elastic',            # Add elastic network
+        '-ef', '700',          # Elastic network force constant
+        '-eu', '0.9',          # Elastic network upper cutoff
+        '-p', 'backbone',      # Position restraints on backbone
+        '-pf', '1000',         # Position restraint force constant
+        '-maxwarn', '1',
+        '-cys', 'auto'         # Auto-detect disulfide bonds
     ]
     
-    # Add C-terminal modification (always amidated for AMPs)
-    if config['coarse_graining']['c_terminal']:
-        base_cmd.extend(["-cter", config['coarse_graining']['c_terminal']])
-    
-    # Use DSSP for secondary structure
-    cmd = list(base_cmd)
-    if config['coarse_graining']['dssp']:
-        cmd.append("-dssp")
-    
-    # For low pLDDT structures, use IDP flag
-    if plddt < 70:
-        cmd.append("--martini3-idp")
-        print(f"Note: Using IDP flag due to low pLDDT ({plddt:.1f})")
-    
-    # Log file
-    log_file = os.path.join(run_dir, "logs", "martinize2.log")
-    
-    print(f"Running Martinize2 for {metadata['peptide_id']}...")
+    print(f"Peptide ID: {peptide_id}")
     print(f"Command: {' '.join(cmd)}")
     
-    # Run Martinize2 with optional DSSP, fallback without DSSP if it fails
-    with open(log_file, 'w') as log:
-        def run_and_log(run_cmd):
-            result = subprocess.run(
-                run_cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True
-            )
-            log.write(result.stdout)
-            return result.returncode, result.stdout
+    # Run Martinize via Docker
+    result = subprocess.run(cmd, capture_output=True, text=True, cwd=str(project_root))
+    
+    if result.returncode != 0:
+        print("\nError running Martinize:")
+        print(result.stderr)
+        sys.exit(1)
+    
+    print("\nMartinize output:")
+    print(result.stdout)
+    
+    # Handle the ITP files created by martinize
+    handle_itp_files(project_root, output_dir, peptide_id)
+    
+    # Create symlinks
+    create_symlinks(output_dir, peptide_id)
+    
+    # Create position restraint file
+    create_position_restraints(output_dir, peptide_id)
+    
+    return peptide_id
 
-        rc, out = run_and_log(cmd)
-        if rc != 0 and config['coarse_graining']['dssp']:
-            print("! DSSP run failed, retrying without DSSP...")
-            cmd_no_dssp = list(base_cmd)
-            print(f"Command: {' '.join(cmd_no_dssp)}")
-            rc, out = run_and_log(cmd_no_dssp)
-        if rc != 0:
-            print(f"✗ Martinize2 failed. Check log: {log_file}")
-            sys.exit(1)
-        print("✓ Martinize2 completed successfully")
+def handle_itp_files(project_root, output_dir, peptide_id):
+    """Handle the two ITP files that martinize creates"""
+    print("\nProcessing ITP files...")
     
-    # Extract secondary structure from log
-    extract_secondary_structure(log_file, output_dir, metadata['peptide_id'])
+    # Martinize creates both NAME.itp (master) and NAME_0.itp (molecule)
+    # We only need the molecule ITP to avoid double counting
     
-    # Fix the ITP file to remove martini.itp include
-    fix_itp_file(output_top)
+    molecule_itp_src = os.path.join(project_root, f"{peptide_id}_0.itp")
+    molecule_itp_dst = os.path.join(output_dir, f"{peptide_id}.itp")
+    master_itp = os.path.join(project_root, f"{peptide_id}.itp")
     
-    # Move molecule ITP file if created in wrong directory
-    molecule_itp = f"{metadata['peptide_id']}_0.itp"
-    wrong_path = os.path.join(os.getcwd(), molecule_itp)
-    correct_path = os.path.join(output_dir, molecule_itp)
-    if os.path.exists(wrong_path) and not os.path.exists(correct_path):
-        import shutil
-        shutil.move(wrong_path, correct_path)
-        print(f"✓ Moved {molecule_itp} to correct directory")
+    # Check if _0.itp exists and move it
+    if os.path.exists(molecule_itp_src):
+        # Move the molecule ITP to the correct location
+        shutil.move(molecule_itp_src, molecule_itp_dst)
+        print(f"  ✓ Moved {peptide_id}_0.itp to coarse_grain/{peptide_id}.itp")
+        
+        # Remove the master ITP (causes double counting)
+        if os.path.exists(master_itp):
+            os.remove(master_itp)
+            print(f"  ✓ Removed master ITP (prevents double counting)")
     
-    # Create a complete topology file that includes the peptide
-    create_complete_topology(output_dir, metadata['peptide_id'], config)
+    # Also check if files were created directly in output_dir (newer martinize versions)
+    alt_molecule_itp = os.path.join(output_dir, f"{peptide_id}_0.itp")
+    alt_master_itp = os.path.join(output_dir, f"{peptide_id}.itp")
     
-    return output_pdb, output_top
+    if os.path.exists(alt_molecule_itp) and not os.path.exists(molecule_itp_dst):
+        shutil.move(alt_molecule_itp, molecule_itp_dst)
+        print(f"  ✓ Renamed {peptide_id}_0.itp to {peptide_id}.itp")
+    
+    # Fix molecule name if needed (martinize might use wrong name)
+    if os.path.exists(molecule_itp_dst):
+        with open(molecule_itp_dst, 'r') as f:
+            content = f.read()
+        
+        # Replace any wrong molecule names
+        original_content = content
+        content = re.sub(r'SIMULATIONS(_0)?', peptide_id, content)
+        content = re.sub(f'{peptide_id}_0', peptide_id, content)  # Remove _0 suffix from molecule name
+        
+        if content != original_content:
+            with open(molecule_itp_dst, 'w') as f:
+                f.write(content)
+            print(f"  ✓ Fixed molecule name to {peptide_id}")
 
-def extract_secondary_structure(log_file, output_dir, peptide_id):
-    """Extract secondary structure from Martinize2 log"""
-    with open(log_file, 'r') as f:
-        lines = f.readlines()
+def create_symlinks(output_dir, peptide_id):
+    """Create symlinks for backward compatibility"""
+    print("\nCreating symlinks...")
     
-    ss_info = {}
-    for i, line in enumerate(lines):
-        if "The following sequence of secondary structure" in line:
-            # Secondary structure is usually 2 lines after
-            if i + 2 < len(lines):
-                ss_line = lines[i + 2].strip()
-                if ss_line and not ss_line.startswith(';'):
-                    ss_info['secondary_structure'] = ss_line
-                    print(f"Secondary structure: {ss_line}")
+    # Change to output directory
+    original_dir = os.getcwd()
+    os.chdir(output_dir)
     
-    # Save secondary structure info
-    if ss_info:
-        with open(os.path.join(output_dir, "secondary_structure.yaml"), 'w') as f:
-            yaml.dump(ss_info, f, default_flow_style=False)
-
-def fix_itp_file(itp_path):
-    """Fix ITP file to remove martini.itp include"""
-    # Read the ITP file
-    with open(itp_path, 'r') as f:
-        lines = f.readlines()
+    # Create symlinks to the actual files
+    symlink_map = {
+        'peptide_cg.pdb': f'{peptide_id}_cg.pdb',
+        'peptide_cg.gro': f'{peptide_id}_cg.pdb',  # GROMACS can read PDB as GRO
+        'peptide_cg.itp': f'{peptide_id}.itp'
+    }
     
-    # Replace martini.itp include with a comment
-    with open(itp_path, 'w') as f:
-        for line in lines:
-            if '#include "martini.itp"' in line:
-                f.write('; Martini force field is included in the main topology file\n')
-            else:
-                f.write(line)
+    for link, target in symlink_map.items():
+        if os.path.exists(link) or os.path.islink(link):
+            os.remove(link)
+        if os.path.exists(target):
+            os.symlink(target, link)
+            print(f"  ✓ {link} -> {target}")
     
-    print("✓ Fixed ITP file includes")
+    # Return to original directory
+    os.chdir(original_dir)
 
-def create_complete_topology(output_dir, peptide_id, config):
-    """Create a complete topology file"""
-    top_content = f"""; Complete topology for {peptide_id}
-; Generated by SOLVIA coarse-graining script
-
-; Include Martini 3 force field
-#include "{config['directories']['force_fields']}/martini_v3.0.0.itp"
-
-; Include peptide topology
-#include "{peptide_id}.itp"
-
-[ system ]
-{peptide_id} in solution
-
-[ molecules ]
-{peptide_id}    1
-"""
+def create_position_restraints(output_dir, peptide_id):
+    """Create position restraint file"""
+    print("\nGenerating position restraints...")
     
-    with open(os.path.join(output_dir, f"{peptide_id}_complete.top"), 'w') as f:
-        f.write(top_content)
+    posre_file = os.path.join(output_dir, "peptide_posre.itp")
+    itp_file = os.path.join(output_dir, f"{peptide_id}.itp")
     
-    print(f"✓ Created complete topology: {peptide_id}_complete.top")
+    if not os.path.exists(itp_file):
+        print(f"  Warning: ITP file not found: {itp_file}")
+        return
+    
+    with open(posre_file, 'w') as f:
+        f.write(f"; Position restraint file for {peptide_id}\n")
+        f.write("; Include this file in topology with:\n")
+        f.write("; #ifdef POSRES\n")
+        f.write("; #include \"peptide_posre.itp\"\n")
+        f.write("; #endif\n\n")
+        f.write("[ position_restraints ]\n")
+        f.write("; atom  type      fx      fy      fz\n")
+        
+        # Extract backbone atoms from ITP
+        with open(itp_file, 'r') as itp:
+            in_atoms = False
+            for line in itp:
+                if '[ atoms ]' in line:
+                    in_atoms = True
+                    continue
+                elif in_atoms and line.startswith('['):
+                    break
+                elif in_atoms and 'BB' in line and not line.startswith(';'):
+                    parts = line.split()
+                    if len(parts) > 0:
+                        atom_id = parts[0]
+                        f.write(f"{atom_id:>6}     1  1000  1000  1000\n")
+    
+    print(f"  ✓ Created {posre_file}")
+
+def print_summary(run_dir, peptide_id, config):
+    """Print summary of coarse-graining results"""
+    rel_run_dir = os.path.relpath(run_dir, Path(__file__).parent.parent.parent)
+    c_terminal = config.get('coarse_graining', {}).get('c_terminal', 'NH2-ter')
+    
+    print(f"\n{'='*50}")
+    print("✅ Coarse-graining complete!")
+    print(f"{'='*50}")
+    print(f"Output files:")
+    print(f"  PDB: {rel_run_dir}/coarse_grain/{peptide_id}_cg.pdb")
+    print(f"  ITP: {rel_run_dir}/coarse_grain/{peptide_id}.itp (single file, no double counting)")
+    print(f"  Position restraints: {rel_run_dir}/coarse_grain/peptide_posre.itp")
+    print(f"\nSymlinks created:")
+    print(f"  peptide_cg.pdb -> {peptide_id}_cg.pdb")
+    print(f"  peptide_cg.itp -> {peptide_id}.itp")
+    print(f"  peptide_cg.gro -> {peptide_id}_cg.pdb")
+    print(f"\nImportant notes:")
+    print(f"  Molecule name: {peptide_id}")
+    print(f"  C-terminal: {c_terminal} (amidated)")
+    print(f"  N-terminal: Protonated (NH3+)")
+    print(f"{'='*50}")
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Run Martinize2 coarse-graining for SOLVIA"
+        description="Coarse-grain peptide structure using Martinize via Docker"
     )
     parser.add_argument(
         "run_dir",
-        help="Run directory"
+        help="Run directory containing ColabFold output"
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Force re-run even if output exists"
     )
     
     args = parser.parse_args()
     
-    # Check if run directory exists
-    if not os.path.exists(args.run_dir):
-        print(f"Error: Run directory not found: {args.run_dir}")
+    # Convert to absolute path
+    run_dir = os.path.abspath(args.run_dir)
+    
+    # Check run directory
+    if not os.path.exists(run_dir):
+        print(f"Error: Run directory not found: {run_dir}")
         sys.exit(1)
     
-    # Run coarse-graining
-    cg_pdb, cg_top = run_martinize2(args.run_dir)
+    # Check if already done (unless forced)
+    peptide_id = extract_peptide_id(run_dir)
+    output_dir = os.path.join(run_dir, "coarse_grain")
+    output_pdb = os.path.join(output_dir, f"{peptide_id}_cg.pdb")
+    output_itp = os.path.join(output_dir, f"{peptide_id}.itp")
     
-    print(f"\n✓ Coarse-grained structure: {os.path.basename(cg_pdb)}")
-    print(f"✓ Topology file: {os.path.basename(cg_top)}")
+    if not args.force and os.path.exists(output_pdb) and os.path.exists(output_itp):
+        print("Coarse-graining already completed. Use --force to re-run.")
+        print_summary(run_dir, peptide_id, load_config())
+        return
     
-    print(f"\nNext step: Build RBC membrane template")
-    print(f"Command: python 04_build_membrane.py {args.run_dir}")
+    # Load configuration
+    config = load_config()
+    metadata = load_run_metadata(run_dir)
+    
+    # Get best structure
+    pdb_path, plddt = get_best_structure(run_dir)
+    print(f"Using best structure: {os.path.basename(pdb_path)} (pLDDT: {plddt:.1f})")
+    
+    # Run martinize via Docker
+    peptide_id = run_martinize_docker(run_dir, pdb_path, config)
+    
+    # Print summary
+    print_summary(run_dir, peptide_id, config)
 
 if __name__ == "__main__":
     main()
