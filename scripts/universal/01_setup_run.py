@@ -14,9 +14,44 @@ from pathlib import Path
 
 def load_config():
     """Load SOLVIA configuration"""
-    config_path = Path(__file__).parent.parent.parent / "config" / "solvia_config.yaml"
-    with open(config_path, 'r') as f:
-        return yaml.safe_load(f)
+    config_dir = Path(__file__).parent.parent.parent / "config"
+    
+    # Try available config files in order of preference
+    config_files = [
+        "config.yaml",
+        "pmf_standard_config.yaml"
+    ]
+    
+    for config_file in config_files:
+        config_path = config_dir / config_file
+        if config_path.exists():
+            with open(config_path, 'r') as f:
+                config = yaml.safe_load(f)
+                
+            # Add default values if missing
+            if 'directories' not in config:
+                config['directories'] = {
+                    'simulations_base': str(config_dir.parent / "simulations")
+                }
+            
+            if 'project' not in config:
+                config['project'] = {
+                    'version': '1.0.0'
+                }
+                
+            print(f"Loaded configuration from: {config_path}")
+            return config
+    
+    # If no config file found, create a minimal default config
+    print("Warning: No config file found, using defaults")
+    return {
+        'directories': {
+            'simulations_base': str(Path(__file__).parent.parent.parent / "simulations")
+        },
+        'project': {
+            'version': '1.0.0'
+        }
+    }
 
 def parse_fasta_header(fasta_file):
     """Extract peptide ID from FASTA file"""
@@ -46,13 +81,13 @@ def create_directory_structure(run_dir):
     directories = [
         "input",
         "colabfold",
-        "cg_pdb",
+        "coarse_grain",
         "membrane_template",
         "system",
         "equilibration/em",
         "equilibration/nvt", 
         "equilibration/npt",
-        "production",
+        "pmf",
         "analysis",
         "logs"
     ]

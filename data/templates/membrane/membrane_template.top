@@ -7,12 +7,12 @@ INSANE! Membrane UpperLeaflet>POPC:PSM:CHOL=0.4:0.15:0.45 LowerLeaflet>POPE:POPS
 
 [ molecules ]
 ; name  number
-POPC            67
-PSM             25
-CHOL            76
-POPE            76
-POPS            25
-CHOL            67
-W             8260
-NA             103
-CL              78
+POPC            90
+PSM             33
+CHOL           101
+POPE           101
+POPS            33
+CHOL            90
+W            11753
+NA             146
+CL             113

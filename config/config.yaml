@@ -43,6 +43,11 @@ simulation:
   timestep: 0.020  # ps (20 fs for Martini 3)
   production_time: 500  # ns
   output_frequency: 1000  # ps
+  # Position restraint policy (equilibration only)
+  posres:
+    em: on
+    nvt: on
+    npt: off
   
 # Machine learning
 ml:
@@ -73,4 +78,3 @@ containers:
   insane: "solvia/insane:latest"
   gromacs: "solvia/gromacs:2025.2-cuda12"
   ml: "solvia/ml-toolkit:latest"
-

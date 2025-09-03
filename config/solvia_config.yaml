@@ -36,7 +36,7 @@ coarse_graining:
 # RBC membrane parameters (evidence-based from concept)
 membrane:
   type: "asymmetric_rbc"
-  box_size: [10, 10, 14]  # nm
+  box_size: [12, 12, 14]  # nm (in-plane enlarged per QC)
   thickness: 4.5  # nm (physiological)
   
   # Outer leaflet composition
@@ -61,12 +61,59 @@ peptide_insertion:
   total_peptides: 8  # Standard occupancy
   distance_from_membrane: 3.0  # nm above membrane surface
   minimum_spacing: 2.5  # nm between peptides
+  # Optional z-jitter to diversify initial z placement (nm)
+  z_jitter:
+    mode: none          # none | normal | uniform
+    std_nm: 0.0         # used if mode=normal
+    range_nm: 0.0       # half-range, used if mode=uniform
+    per_peptide: false  # if true, sample per peptide; else per replicate
+  # Thermodynamic placement (optional)
+  thermo:
+    d_opt: 1.8        # nm preferred neighbor distance (cooperative)
+    cutoff: 2.5       # nm interaction cutoff
+    mc_steps: 2000    # Monte Carlo refinement steps
+    step_sigma: 0.1   # nm proposal stddev
+    sigma_frac: 0.15      # Gaussian well width as fraction of d_opt
+    repulsion_exponent: 12.0
+    repulsion_scale: 1.0
+    attraction_scale: 1.0
+    # Per-residue transfer energies (kJ/mol); overrides internal defaults if provided
+    # energies_kj:
+    #   W: -12.3
+    #   F: -7.8
+    #   L: -4.2
+    #   I: -4.5
+    #   Y: -5.3
+    #   V: -3.5
+    #   M: -2.5
+    #   A: 0.7
+    #   G: 1.0
+    #   S: 3.7
+    #   T: 2.7
+    #   P: 3.0
+    #   H: 4.6
+    #   N: 8.6
+    #   Q: 9.2
+    #   D: 10.5
+    #   E: 8.2
+    #   K: 10.0
+    #   R: 12.3
   
   # Multi-occupancy levels for testing
   occupancy_levels:
     low: 8     # P:L ratio ~1:42
     medium: 12 # P:L ratio ~1:28
     high: 16   # P:L ratio ~1:21
+  # Cooperative (non-thermo) placement defaults
+  cooperative:
+    d_opt: 1.8
+    cutoff: 2.5
+    mc_steps: 2000
+    step_sigma: 0.1
+    sigma_frac: 0.15
+    repulsion_exponent: 12.0
+    repulsion_scale: 1.0
+    attraction_scale: 1.0
 
 # MD simulation parameters
 simulation:
@@ -138,3 +185,23 @@ pmf:
   # lipid_resnames: ["POPC", "POPE", "POPS", "CHOL", "PSM"]
   # peptide_min_atoms: 5
   # peptide_max_atoms: 5000
+  
+  # New umbrella/QC settings aligned with pmf_standard_config
+  umbrella:
+    ref_mode: "patch"
+    consistent_reference: true   # Use same reference group for all windows
+    patch_radius: 2.0            # nm around peptide COM (for LocalPatch)
+    # Provide force_constant for runner compatibility (mirrors spring_k if used)
+    force_constant: 700          # kJ/mol/nm^2
+  
+  qc:
+    # QC thresholds aligned with pmf_standard_config
+    min_neighbor_overlap: 0.10   # Hard minimum for adjacent window overlap
+    target_overlap: 0.20         # Target for auto-densification
+    min_ess_frames: 200          # Effective sample size threshold
+    half_energy_tol_kj: 2.0      # Half-time energy difference tolerance (kJ/mol)
+    max_qc_rounds: 3             # Densify/extend cycles
+    auto_extend: true            # Automatically extend failing windows
+    extend_ns: 10.0              # Per-iteration extension
+    max_extend_ns: 20.0          # Cap per window
+    discard_fraction: 0.10       # Discard initial 10% for QC (ESS/half-energy)

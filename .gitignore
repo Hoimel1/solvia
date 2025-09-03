@@ -38,6 +38,8 @@ htmlcov/
 # Logs & runtime
 logs/
 *.log
+**/step*.pdb
+\#step*.pdb*
 
 # Data outputs (keep raw inputs versioned)
 data/intermediate/

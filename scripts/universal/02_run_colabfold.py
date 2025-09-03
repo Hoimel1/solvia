@@ -12,12 +12,381 @@ import argparse
 import subprocess
 from pathlib import Path
 import numpy as np
+import shutil
+
+def read_fasta(path):
+    with open(path, 'r') as f:
+        lines = [l.strip() for l in f if l.strip()]
+    seq = ''.join(l for l in lines if not l.startswith('>'))
+    return seq
+
+def _kyte_doolittle_scores():
+    # Kyte-Doolittle hydropathy index
+    return {
+        'I': 4.5, 'V': 4.2, 'L': 3.8, 'F': 2.8, 'C': 2.5, 'M': 1.9, 'A': 1.8,
+        'G': -0.4, 'T': -0.7, 'S': -0.8, 'W': -0.9, 'Y': -1.3, 'P': -1.6,
+        'H': -3.2, 'E': -3.5, 'Q': -3.5, 'D': -3.5, 'N': -3.5, 'K': -3.9, 'R': -4.5
+    }
+
+def predict_tm_segments(seq: str, window: int = 19, threshold: float = 1.6):
+    """Predict TM helices using Kyte-Doolittle sliding window.
+    Returns list of (start, end) indices for putative segments.
+    """
+    seq = (seq or '').upper()
+    if not seq:
+        return []
+    kd = _kyte_doolittle_scores()
+    n = len(seq)
+    vals = [kd.get(ch, 0.0) for ch in seq]
+    segs = []
+    for i in range(0, max(0, n - window + 1)):
+        mean = sum(vals[i:i+window]) / window
+        if mean >= threshold:
+            # extend contiguous windows
+            start = i
+            j = i + 1
+            while j <= n - window and (sum(vals[j:j+window]) / window) >= threshold:
+                j += 1
+            segs.append((start, j + window - 1))
+            i = j
+    # Merge overlapping/adjacent
+    merged = []
+    for s, e in segs:
+        if not merged or s > merged[-1][1] + 1:
+            merged.append([s, e])
+        else:
+            merged[-1][1] = max(merged[-1][1], e)
+    return [(int(a), int(b)) for a, b in merged]
+
+def analyze_sequence_properties(seq: str):
+    seq = (seq or '').upper()
+    n = len(seq)
+    if n == 0:
+        return {'length': 0, 'cysteine_fraction': 0.0, 'has_transmembrane': False, 'tm_segments': []}
+    cyst_frac = seq.count('C') / n
+    tm_segs = predict_tm_segments(seq)
+    return {'length': n, 'cysteine_fraction': cyst_frac, 'has_transmembrane': bool(tm_segs), 'tm_segments': tm_segs}
+
+def _tool_available(name: str) -> bool:
+    try:
+        return shutil.which(name) is not None
+    except Exception:
+        return False
+
+def predict_tm_segments_tools(fasta_path: str):
+    """Try TMHMM or Phobius if available; return list of (start,end) 0-based inclusive.
+    Fallback to empty list if tools unavailable or parsing fails.
+    """
+    def _parse_segments_from_text(txt: str):
+        segs = []
+        lines = [l.strip() for l in txt.splitlines() if l.strip()]
+        for l in lines:
+            u = l.upper()
+            # Accept common markers
+            if ('TRANSMEM' in u) or ('TMHELIX' in u) or ('TOPOLOGY' in u):
+                import re
+                # Look for ranges like 12-34
+                for a, b in re.findall(r'(\d+)\s*-\s*(\d+)', u):
+                    try:
+                        s = max(0, int(a) - 1)
+                        e = max(s, int(b) - 1)
+                        segs.append((s, e))
+                    except Exception:
+                        continue
+        # Merge overlapping
+        segs.sort()
+        merged = []
+        for s, e in segs:
+            if not merged or s > merged[-1][1] + 1:
+                merged.append([s, e])
+            else:
+                merged[-1][1] = max(merged[-1][1], e)
+        return [(int(a), int(b)) for a, b in merged]
+
+    # Try TMHMM
+    try:
+        if _tool_available('tmhmm'):
+            res = subprocess.run(['tmhmm', fasta_path], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False)
+            segs = _parse_segments_from_text(res.stdout or '')
+            if segs:
+                return segs
+    except Exception:
+        pass
+    # Try Phobius (binary name can be 'phobius' or 'phobius.pl')
+    try:
+        for exe in ('phobius', 'phobius.pl'):
+            if _tool_available(exe):
+                # Use -long if supported to include TRANSMEM lines
+                res = subprocess.run([exe, '-long', fasta_path], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False)
+                segs = _parse_segments_from_text(res.stdout or '')
+                if segs:
+                    return segs
+    except Exception:
+        pass
+    return []
+
+def analyze_sequence_properties_fasta(fasta_path: str):
+    seq = read_fasta(fasta_path)
+    props = analyze_sequence_properties(seq)
+    try:
+        tool_segs = predict_tm_segments_tools(fasta_path)
+        if tool_segs:
+            props['tm_segments'] = tool_segs
+            props['has_transmembrane'] = True
+    except Exception:
+        pass
+    return props
+
+def optimize_colabfold_params(base_cfg: dict, fasta_path: str):
+    cfg = dict(base_cfg)
+    try:
+        props = analyze_sequence_properties_fasta(fasta_path)
+        n = props['length']
+        if n and n < 50:
+            cfg['num_models'] = max(cfg.get('num_models', 5), 10)
+            cfg['num_replicates'] = max(cfg.get('num_replicates', 5), 10)
+            cfg['msa_mode'] = 'single_sequence'
+        if props['cysteine_fraction'] > 0.1:
+            cfg['relax'] = True
+        if props['has_transmembrane']:
+            cfg['num_replicates'] = max(cfg.get('num_replicates', 5), 8)
+    except Exception:
+        pass
+    return cfg
+
+def parse_pdb_plddt(pdb_file):
+    vals = []
+    ca_coords = []
+    with open(pdb_file, 'r') as f:
+        for line in f:
+            if line.startswith('ATOM'):
+                try:
+                    b = float(line[60:66])
+                    vals.append(b)
+                except Exception:
+                    pass
+                if line[12:16].strip() == 'CA':
+                    x = float(line[30:38]); y = float(line[38:46]); z = float(line[46:54])
+                    ca_coords.append([x, y, z])
+    return np.array(vals) if vals else None, (np.array(ca_coords) if ca_coords else None)
+
+def kabsch_rmsd(P, Q):
+    # assume shapes (N,3)
+    if P is None or Q is None:
+        return None
+    if P.shape != Q.shape or P.shape[0] < 3:
+        return None
+    Pc = P - P.mean(axis=0)
+    Qc = Q - Q.mean(axis=0)
+    C = Pc.T @ Qc
+    V, S, Wt = np.linalg.svd(C)
+    d = np.sign(np.linalg.det(V @ Wt))
+    D = np.diag([1,1,d])
+    U = V @ D @ Wt
+    R = Pc @ U
+    diff = R - Qc
+    return float(np.sqrt((diff*diff).sum() / P.shape[0]))
+
+def clash_score(pdb_file, softness=0.4):
+    """Atom-typed clash score using vdW radii; returns clashes per atom.
+    Coordinates are in Å from PDB. softness (Å) tolerates small overlaps.
+    """
+    coords = []
+    res_ids = []
+    elems = []
+    with open(pdb_file,'r') as f:
+        for line in f:
+            if not line.startswith('ATOM'):
+                continue
+            try:
+                resi = int(line[22:26])
+                x = float(line[30:38]); y = float(line[38:46]); z = float(line[46:54])
+                name = line[12:16].strip()
+                elem = line[76:78].strip() if len(line) >= 78 and line[76:78].strip() else name[0]
+            except Exception:
+                continue
+            coords.append((x,y,z)); res_ids.append(resi); elems.append(elem.upper())
+    N = len(coords)
+    if N < 2:
+        return 0.0
+    coords = np.array(coords)
+    vdw = {'H':1.20,'C':1.70,'N':1.55,'O':1.52,'S':1.80,'P':1.80}
+    clashes = 0
+    for i in range(N-1):
+        for j in range(i+1, N):
+            if abs(res_ids[i]-res_ids[j]) <= 2:
+                continue
+            d = np.linalg.norm(coords[i]-coords[j])
+            ri = vdw.get(elems[i], 1.7); rj = vdw.get(elems[j], 1.7)
+            thr = max(0.0, ri + rj - softness)
+            if d < thr:
+                clashes += 1
+    return clashes / N
+
+def _dihedral(a, b, c, d):
+    # a,b,c,d: 3D vectors
+    import numpy as _np
+    b0 = a - b
+    b1 = c - b
+    b2 = d - c
+    b1 /= _np.linalg.norm(b1) if _np.linalg.norm(b1) != 0 else 1.0
+    v = b0 - _np.dot(b0, b1) * b1
+    w = b2 - _np.dot(b2, b1) * b1
+    x = _np.dot(v, w)
+    y = _np.dot(_np.cross(b1, v), w)
+    return float(_np.degrees(_np.arctan2(y, x)))
+
+def _parse_backbone_coords(pdb_file):
+    # returns dict resid -> {'N':xyz,'CA':xyz,'C':xyz,'SG':xyz}
+    bb = {}
+    with open(pdb_file,'r') as f:
+        for line in f:
+            if not line.startswith('ATOM'):
+                continue
+            try:
+                atom = line[12:16].strip()
+                res = line[17:20].strip()
+                resid = int(line[22:26])
+                x = float(line[30:38]); y = float(line[38:46]); z = float(line[46:54])
+            except Exception:
+                continue
+            if resid not in bb:
+                bb[resid] = {'res': res}
+            if atom in ('N','CA','C','SG'):
+                bb[resid][atom] = np.array([x,y,z], dtype=float)
+    return bb
+
+def ramachandran_quality(pdb_file):
+    bb = _parse_backbone_coords(pdb_file)
+    resids = sorted(bb.keys())
+    favored = 0; allowed = 0; total = 0
+    helix_like = 0; beta_like = 0
+    for i in range(1, len(resids)-1):
+        r_prev = bb.get(resids[i-1], {})
+        r = bb.get(resids[i], {})
+        r_next = bb.get(resids[i+1], {})
+        if not all(k in r for k in ('N','CA','C')):
+            continue
+        if 'C' not in r_prev or 'N' not in r_next:
+            continue
+        try:
+            phi = _dihedral(r_prev['C'], r['N'], r['CA'], r['C'])
+            psi = _dihedral(r['N'], r['CA'], r['C'], r_next['N'])
+        except Exception:
+            continue
+        total += 1
+        resname = (r.get('res') or '').upper()
+        # residue-class specific boxes (simplified MolProbity-like regions)
+        # General (non-Gly/Pro)
+        gen_fav = ((-160 <= phi <= -40 and -80 <= psi <= 50) or (-180 <= phi <= -70 and 90 <= psi <= 180))
+        gen_all = gen_fav or ((-180 <= phi <= -20 and -150 <= psi <= 90) or (-180 <= phi <= -20 and 60 <= psi <= 180))
+        # Glycine (wider)
+        gly_fav = ((-180 <= phi <= -20 and -100 <= psi <= 100) or (-100 <= phi <= 100 and 90 <= psi <= 180))
+        gly_all = gly_fav or (-180 <= phi <= 180 and -180 <= psi <= 180)
+        # Proline (restricted phi)
+        pro_fav = (-90 <= phi <= -30 and -80 <= psi <= 50)
+        pro_all = pro_fav or (-120 <= phi <= -10 and -120 <= psi <= 90)
+        if resname == 'GLY':
+            fav = gly_fav; allow = gly_all
+        elif resname == 'PRO':
+            fav = pro_fav; allow = pro_all
+        else:
+            fav = gen_fav; allow = gen_all
+        if fav:
+            favored += 1
+        elif allow:
+            allowed += 1
+        # simple ss proxies
+        if (-90 <= phi <= -30 and -80 <= psi <= -20):
+            helix_like += 1
+        if (-180 <= phi <= -100 and 90 <= psi <= 180):
+            beta_like += 1
+    frac_favored = (favored/total) if total else 0.0
+    frac_allowed = ((favored+allowed)/total) if total else 0.0
+    ss = {
+        'helix_frac': (helix_like/total) if total else 0.0,
+        'beta_frac': (beta_like/total) if total else 0.0
+    }
+    return {'favored': frac_favored, 'allowed': frac_allowed, 'n_eval': total, 'secondary_structure': ss}
+
+def disulfide_analysis(pdb_file):
+    # detect SG-SG within 1.9–2.2 Å; bad if <1.9 or >2.5 with both Cys near
+    bb = _parse_backbone_coords(pdb_file)
+    cys_res = [rid for rid, rec in bb.items() if rec.get('res','').upper().startswith('CYS') and 'SG' in rec]
+    pairs = []
+    bad = 0
+    for i in range(len(cys_res)-1):
+        for j in range(i+1, len(cys_res)):
+            a = bb[cys_res[i]]['SG']; b = bb[cys_res[j]]['SG']
+            d = float(np.linalg.norm(a-b))
+            if d <= 2.5:
+                pairs.append({'res1': int(cys_res[i]), 'res2': int(cys_res[j]), 'distance_A': d*10.0/10.0})
+                if d < 1.9 or d > 2.2:
+                    bad += 1
+    return {'count': len(pairs), 'bad_count': bad, 'pairs': pairs}
 
 def load_config():
     """Load SOLVIA configuration"""
-    config_path = Path(__file__).parent.parent.parent / "config" / "solvia_config.yaml"
-    with open(config_path, 'r') as f:
-        return yaml.safe_load(f)
+    config_dir = Path(__file__).parent.parent.parent / "config"
+    
+    # Try available config files in order of preference
+    config_files = [
+        "config.yaml",
+        "pmf_standard_config.yaml"
+    ]
+    
+    for config_file in config_files:
+        config_path = config_dir / config_file
+        if config_path.exists():
+            with open(config_path, 'r') as f:
+                config = yaml.safe_load(f)
+                
+            # Add default ColabFold values if missing
+            if 'colabfold' not in config:
+                config['colabfold'] = {}
+            
+            colabfold_defaults = {
+                'num_replicates': 5,
+                'num_models': 5,
+                'msa_mode': 'mmseqs2_uniref_env',
+                'pair_mode': 'unpaired_paired',
+                'relax': True,
+                'min_plddt': 70,
+                'selection': {
+                    'method': 'weighted',  # weighted | rank
+                    'weights': {
+                        'plddt_mean': 0.30,
+                        'plddt90_frac': 0.20,
+                        'plddt70_frac': 0.15,
+                        'plddt_lt50_frac': -0.10,
+                        'ptm': 0.10,
+                        'ensemble_agreement': 0.10,
+                        'rama_favored': 0.05,
+                        'disulfide_ok': 0.05,
+                        'clash_penalty': -0.10
+                    }
+                }
+            }
+            
+            for key, default_value in colabfold_defaults.items():
+                if key not in config['colabfold']:
+                    config['colabfold'][key] = default_value
+                
+            print(f"Loaded configuration from: {config_path}")
+            return config
+    
+    # If no config file found, create a minimal default config
+    print("Warning: No config file found, using defaults")
+    return {
+        'colabfold': {
+            'num_replicates': 5,
+            'num_models': 5,
+            'msa_mode': 'mmseqs2_uniref_env',
+            'pair_mode': 'unpaired_paired',
+            'relax': True,
+            'min_plddt': 70
+        }
+    }
 
 def load_run_metadata(run_dir):
     """Load run metadata"""
@@ -80,18 +449,21 @@ def run_colabfold(run_dir):
         print("="*70)
         return None, 0
     
+    # Optimize parameters based on sequence properties
+    cfg_cf = optimize_colabfold_params(config['colabfold'], input_fasta)
+
     # Build ColabFold command (native installation)
     cmd = [
         "colabfold_batch",
         input_fasta,
         output_dir,
-        "--num-seeds", str(config['colabfold']['num_replicates']),
-        "--num-models", str(config['colabfold']['num_models']),
-        "--msa-mode", config['colabfold']['msa_mode'],
-        "--pair-mode", config['colabfold']['pair_mode'],
+        "--num-seeds", str(cfg_cf['num_replicates']),
+        "--num-models", str(cfg_cf['num_models']),
+        "--msa-mode", cfg_cf['msa_mode'],
+        "--pair-mode", cfg_cf['pair_mode'],
     ]
-    
-    if config['colabfold']['relax']:
+
+    if cfg_cf.get('relax', True):
         cmd.append("--amber")
         cmd.append("--use-gpu-relax")
     
@@ -151,7 +523,7 @@ def select_best_model_by_bfactor(pdb_files):
     return best_pdb, best_plddt
 
 def select_best_model(output_dir, config):
-    """Select best model based on pLDDT score"""
+    """Select best model using multi-criteria scientific scoring and export ensemble analysis."""
     # Find all PDB files first
     import glob
     pdb_files = glob.glob(os.path.join(output_dir, "*_unrelaxed_rank_*.pdb"))
@@ -166,11 +538,18 @@ def select_best_model(output_dir, config):
     # Find all score files
     score_files = glob.glob(os.path.join(output_dir, "*_scores_rank_*.json"))
     
+    # Gather per-model metrics
+    models = []
+    # Map rank -> score data
+    score_map = {}
     if not score_files:
         print("Warning: No score files found, extracting pLDDT from B-factors...")
-        best_pdb, best_plddt = select_best_model_by_bfactor(all_pdb_files)
+        for pdb_file in all_pdb_files:
+            plddt_vec, ca = parse_pdb_plddt(pdb_file)
+            plddt_mean = float(np.mean(plddt_vec)) if plddt_vec is not None and plddt_vec.size else 0.0
+            models.append({'pdb': pdb_file, 'rank': None, 'plddt_vec': plddt_vec, 'plddt_mean': plddt_mean, 'ptm': None, 'ca': ca})
     else:
-        # Extract pLDDT scores from score files
+        # Extract pLDDT list and ptm if present
         plddt_scores = {}
         for score_file in score_files:
             with open(score_file, 'r') as f:
@@ -183,43 +562,162 @@ def select_best_model(output_dir, config):
                 rank = int(match.group(1))
                 model_name = f"rank_{rank:03d}"
                 
-                # pLDDT is usually stored as 'plddt' or 'plddts' 
-                if 'plddt' in data:
-                    if isinstance(data['plddt'], list):
-                        plddt = np.mean(data['plddt'])
-                    else:
-                        plddt = data['plddt']
-                elif 'plddts' in data:
-                    if isinstance(data['plddts'], list):
-                        plddt = np.mean(data['plddts'])
-                    else:
-                        plddt = data['plddts']
-                else:
-                    continue
-                
-                plddt_scores[model_name] = plddt
-                print(f"  Model {model_name}: pLDDT = {plddt:.1f}")
-        
-        if not plddt_scores:
-            print("Warning: Could not extract pLDDT from score files, using B-factors...")
-            best_pdb, best_plddt = select_best_model_by_bfactor(all_pdb_files)
+                # pLDDT vector if available
+                plddt_vec = None
+                if 'plddt' in data and isinstance(data['plddt'], list):
+                    plddt_vec = np.array(data['plddt'], dtype=float)
+                elif 'plddts' in data and isinstance(data['plddts'], list):
+                    plddt_vec = np.array(data['plddts'], dtype=float)
+                plddt_mean = float(np.mean(plddt_vec)) if plddt_vec is not None and plddt_vec.size else (float(data.get('plddt', data.get('plddts', 0.0))))
+                ptm = data.get('ptm', data.get('iptm', None))
+                plddt_scores[model_name] = plddt_mean
+                # map rank to pdb and metrics
+                rank_num = rank
+                pdb_match = None
+                for pdb_file in all_pdb_files:
+                    if f"rank_{rank_num:03d}" in pdb_file or f"rank_{rank_num:01d}" in pdb_file:
+                        pdb_match = pdb_file; break
+                plddt_vec_pdb, ca = parse_pdb_plddt(pdb_match) if pdb_match else (None, None)
+                models.append({'pdb': pdb_match, 'rank': rank_num, 'plddt_vec': (plddt_vec or plddt_vec_pdb), 'plddt_mean': plddt_mean, 'ptm': ptm, 'ca': ca})
+
+    # Compute ensemble RMSD matrix
+    n_models = len(models)
+    rmsd_matrix = [[None]*n_models for _ in range(n_models)]
+    for i in range(n_models):
+        for j in range(i+1, n_models):
+            rms = kabsch_rmsd(models[i]['ca'], models[j]['ca'])
+            rmsd_matrix[i][j] = rmsd_matrix[j][i] = (float(rms) if rms is not None else None)
+
+    # Compute composite scores (configurable)
+    sel_cfg = (config.get('colabfold') or {}).get('selection', {})
+    method = str(sel_cfg.get('method', 'weighted')).lower()
+    weights = (sel_cfg.get('weights') or {})
+    composite = []
+    ranks = []
+    for i, m in enumerate(models):
+        pvec = m['plddt_vec']
+        mean_plddt = float(m['plddt_mean'] or 0.0)
+        if pvec is None or pvec.size == 0:
+            p90 = p70 = low = 0.0
         else:
-            # Select best model
-            best_model = max(plddt_scores, key=plddt_scores.get)
-            best_plddt = plddt_scores[best_model]
-            
-            # Find corresponding PDB file
-            rank_num = int(best_model.split('_')[1])
-            best_pdb = None
-            
-            for pdb_file in all_pdb_files:
-                if f"rank_{rank_num:03d}" in pdb_file or f"rank_{rank_num:01d}" in pdb_file:
-                    best_pdb = pdb_file
-                    break
-            
-            if not best_pdb:
-                print(f"Warning: Could not find PDB file for {best_model}")
-                best_pdb = all_pdb_files[0]  # Fallback to first file
+            p90 = float(np.mean(pvec >= 90.0))
+            p70 = float(np.mean(pvec >= 70.0))
+            low = float(np.mean(pvec < 50.0))
+        ptm = m['ptm'] if m['ptm'] is not None else 0.5
+        # clash penalty (lower is better)
+        cpen = clash_score(m['pdb']) if m['pdb'] else 0.0
+        # ensemble agreement score
+        if n_models >= 2:
+            vals = [v for v in rmsd_matrix[i] if v is not None]
+            mean_r = float(np.mean(vals)) if vals else None
+            agree = (1.0 / (1.0 + mean_r)) if mean_r is not None else 0.5
+        else:
+            agree = 0.5
+        # validation-derived metrics
+        rama_favored = 0.0
+        disulf_ok = 1.0
+        # place holders, adjusted below when validations computed
+        metrics = {
+            'plddt_mean': (mean_plddt / 100.0),
+            'plddt90_frac': p90,
+            'plddt70_frac': p70,
+            'plddt_lt50_frac': low,
+            'ptm': float(ptm) if isinstance(ptm, (int, float)) else 0.5,
+            'ensemble_agreement': agree,
+            'clash_penalty': min(1.0, cpen)  # clamp
+        }
+        composite.append(metrics)
+
+    # Structural validation for each model (Ramachandran + disulfide)
+    validations = []
+    for m in models:
+        try:
+            rama = ramachandran_quality(m['pdb']) if m['pdb'] else {'favored': 0.0, 'allowed': 0.0, 'n_eval': 0}
+            ssb = disulfide_analysis(m['pdb']) if m['pdb'] else {'count': 0, 'bad_count': 0}
+        except Exception:
+            rama = {'favored': 0.0, 'allowed': 0.0, 'n_eval': 0}
+            ssb = {'count': 0, 'bad_count': 0}
+        validations.append({'ramachandran': rama, 'disulfides': ssb})
+
+    # Finalize composite scores per config (and collect selection metrics for logging)
+    final_scores = []
+    selection_metrics = []
+    if method == 'rank':
+        # Rank-aggregate each metric then sum ranks (lower is better)
+        metric_names = ['plddt_mean','plddt90_frac','plddt70_frac','ptm','ensemble_agreement','rama_favored','disulfide_ok']
+        arrays = {k: [] for k in metric_names}
+        for i, metrics in enumerate(composite):
+            arrays['plddt_mean'].append(metrics['plddt_mean'])
+            arrays['plddt90_frac'].append(metrics['plddt90_frac'])
+            arrays['plddt70_frac'].append(metrics['plddt70_frac'])
+            arrays['ptm'].append(metrics['ptm'])
+            arrays['ensemble_agreement'].append(metrics['ensemble_agreement'])
+            arrays['rama_favored'].append(validations[i]['ramachandran']['favored'])
+            arrays['disulfide_ok'].append(1.0 if validations[i]['disulfides']['bad_count'] == 0 else 0.0)
+        # compute per-metric ranks (descending desirable)
+        ranks_by_metric = {}
+        ranksums = [0.0] * len(composite)
+        for k, vals in arrays.items():
+            order = np.argsort(-np.array(vals, dtype=float))
+            rank = np.empty_like(order, dtype=float)
+            rank[order] = np.arange(1, len(order) + 1)
+            ranks_by_metric[k] = rank.tolist()
+            for i in range(len(composite)):
+                ranksums[i] += rank[i]
+        final_scores = [-r for r in ranksums]
+        # build selection metrics per model
+        for i, metrics in enumerate(composite):
+            mvals = dict(metrics)
+            mvals['rama_favored'] = validations[i]['ramachandran']['favored']
+            mvals['disulfide_ok'] = 1.0 if validations[i]['disulfides']['bad_count'] == 0 else 0.0
+            selection_metrics.append({
+                'model': os.path.basename(models[i]['pdb']) if models[i]['pdb'] else None,
+                'method': 'rank',
+                'metric_values': mvals,
+                'metric_ranks': {k: ranks_by_metric[k][i] for k in ranks_by_metric},
+                'rank_sum': float(-final_scores[i]),
+                'final_score': float(final_scores[i])
+            })
+    else:
+        # Weighted sum per config
+        w = {
+            'plddt_mean': float(weights.get('plddt_mean', 0.30)),
+            'plddt90_frac': float(weights.get('plddt90_frac', 0.20)),
+            'plddt70_frac': float(weights.get('plddt70_frac', 0.15)),
+            'plddt_lt50_frac': float(weights.get('plddt_lt50_frac', -0.10)),
+            'ptm': float(weights.get('ptm', 0.10)),
+            'ensemble_agreement': float(weights.get('ensemble_agreement', 0.10)),
+            'rama_favored': float(weights.get('rama_favored', 0.05)),
+            'disulfide_ok': float(weights.get('disulfide_ok', 0.05)),
+            'clash_penalty': float(weights.get('clash_penalty', -0.10)),
+        }
+        for i, metrics in enumerate(composite):
+            score = (
+                w['plddt_mean'] * metrics['plddt_mean'] +
+                w['plddt90_frac'] * metrics['plddt90_frac'] +
+                w['plddt70_frac'] * metrics['plddt70_frac'] +
+                w['plddt_lt50_frac'] * metrics['plddt_lt50_frac'] +
+                w['ptm'] * metrics['ptm'] +
+                w['ensemble_agreement'] * metrics['ensemble_agreement'] +
+                w['rama_favored'] * validations[i]['ramachandran']['favored'] +
+                w['disulfide_ok'] * (1.0 if validations[i]['disulfides']['bad_count'] == 0 else 0.0) +
+                w['clash_penalty'] * metrics['clash_penalty']
+            )
+            final_scores.append(score)
+            mvals = dict(metrics)
+            mvals['rama_favored'] = validations[i]['ramachandran']['favored']
+            mvals['disulfide_ok'] = 1.0 if validations[i]['disulfides']['bad_count'] == 0 else 0.0
+            selection_metrics.append({
+                'model': os.path.basename(models[i]['pdb']) if models[i]['pdb'] else None,
+                'method': 'weighted',
+                'metric_values': mvals,
+                'weights': w,
+                'final_score': float(score)
+            })
+
+    best_idx = int(np.argmax(final_scores)) if final_scores else 0
+    best_pdb = models[best_idx]['pdb'] if models else None
+    best_plddt = float(models[best_idx]['plddt_mean']) if models else 0.0
     
     # Check minimum pLDDT threshold
     if best_plddt < config['colabfold']['min_plddt']:
@@ -231,13 +729,49 @@ def select_best_model(output_dir, config):
         'best_model': os.path.basename(best_pdb) if best_pdb else None,
         'best_plddt': float(best_plddt),
         'best_pdb': best_pdb,
-        'min_plddt_threshold': config['colabfold']['min_plddt']
+        'min_plddt_threshold': config['colabfold']['min_plddt'],
+        'models': [
+            {
+                'pdb': os.path.basename(m['pdb']) if m['pdb'] else None,
+                'rank': m['rank'],
+                'plddt_mean': float(m['plddt_mean'] or 0.0),
+                'plddt90_frac': float(np.mean(m['plddt_vec']>=90.0)) if m['plddt_vec'] is not None and m['plddt_vec'].size else None,
+                'plddt70_frac': float(np.mean(m['plddt_vec']>=70.0)) if m['plddt_vec'] is not None and m['plddt_vec'].size else None,
+                'plddt_lt50_frac': float(np.mean(m['plddt_vec']<50.0)) if m['plddt_vec'] is not None and m['plddt_vec'].size else None,
+                'ptm': (float(m['ptm']) if isinstance(m['ptm'], (int,float)) else None),
+                'composite_score': float(final_scores[i]),
+                'validation': validations[i]
+            }
+            for i, m in enumerate(models)
+        ]
     }
     
     selection_file = os.path.join(output_dir, "model_selection.yaml")
     with open(selection_file, 'w') as f:
         yaml.dump(selection, f, default_flow_style=False)
     
+    # Save ensemble RMSD
+    try:
+        ens = {
+            'rmsd_matrix': rmsd_matrix,
+            'mean_pairwise_rmsd': float(np.nanmean([v for row in rmsd_matrix for v in (row or []) if v is not None])) if rmsd_matrix else None
+        }
+        with open(os.path.join(output_dir, 'ensemble_analysis.yaml'), 'w') as f:
+            yaml.dump(ens, f, default_flow_style=False)
+    except Exception:
+        pass
+
+    # Save selection metrics for auditability
+    try:
+        selm = {
+            'method': method,
+            'entries': selection_metrics
+        }
+        with open(os.path.join(output_dir, 'selection_metrics.yaml'), 'w') as f:
+            yaml.dump(selm, f, default_flow_style=False)
+    except Exception:
+        pass
+
     # Create symbolic link to best model
     if best_pdb and os.path.exists(best_pdb):
         best_link = os.path.join(output_dir, "best_model.pdb")

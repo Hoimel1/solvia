@@ -11,7 +11,7 @@ SOLVIA ist eine **vollständig containerisierte** Pipeline zur Vorhersage der h�
 ## Pipeline-Architektur
 
 ```
-ColabFold → Martinize2 → INSANE → GROMACS → PMF/Umbrella → MBAR → Toxizitätsklassifikation
+ColabFold → Martinize2 → INSANE → GROMACS → PMF/Umbrella → WHAM (Standard) / MBAR → Toxizitätsklassifikation
 ```
 
 ## Voraussetzungen
@@ -31,7 +31,7 @@ ColabFold → Martinize2 → INSANE → GROMACS → PMF/Umbrella → MBAR → To
 cd /home/michelhuller/solvia
 
 # Run-Setup für einzelnes Peptid
-python3 scripts/universal/01_setup_run.py data/raw/fasta/SOLVIA_1.fasta
+python3 scripts/universal/01_setup_run.py data/raw/fasta/SOLVIA_12.fasta
 
 # Struktur:
 # simulations/solvia_1_run_1/
@@ -43,7 +43,7 @@ python3 scripts/universal/01_setup_run.py data/raw/fasta/SOLVIA_1.fasta
 
 ```bash
 # Variable für Run-Verzeichnis
-RUN_DIR="simulations/solvia_1_run_1"
+RUN_DIR="simulations/solvia_12_run_1"
 
 # ColabFold für Strukturvorhersage
 docker compose run --rm \
@@ -202,13 +202,14 @@ gmx mdrun -v -deffnm npt
 
 ## Schritt 6: PMF-Berechnung mit Umbrella Sampling
 
-### 6.1 PMF mit lokaler Patch-Referenz (EMPFOHLEN)
+### 6.1 PMF mit lokaler Midplane-Referenz (EMPFOHLEN)
 
 ```bash
-# Enhanced PMF mit lokaler Patch-Referenz
+# Enhanced PMF mit lokaler Midplane-Referenz
 python3 scripts/universal/08_run_pmf.py ${RUN_DIR} \
   --replicate 1 \
-  --tag pmf_local
+  --tag pmf_midplane
+  --resume
 
 # Für mehrere Replikate:
 for REP in 1 2 3; do
@@ -218,28 +219,60 @@ for REP in 1 2 3; do
 done
 
 # Features:
-# - Dynamische Patch-Referenz (2 nm Radius)
+# - Lokale Midplane-Referenz (balancierte Outer/Inner PO4, ~2.5 nm Radius)
 # - Adaptive Fenster-Verdichtung
 # - SMD-Initialisierung
 # - Automatische QC-Gates
+# - Logging (run.log), Resume & QC-only
 ```
 
 **Window-Strategie:**
 - **Bulk:** +2.8, +2.4 nm
 - **Coarse:** 0.2 nm Schritte
-- **Dense (Interface):** +0.6 bis -0.6 nm, 0.15 nm Schritte
+- **Dense (Interface):** +0.6 bis -0.6 nm, 0.10 nm Schritte
 - **Deep:** bis -2.0 nm
 
-## Schritt 7: PMF-Analyse mit MBAR/WHAM
+Hinweis zur Referenz:
+- Standard ist `ref_mode: midplane_local` (balanciert Outer/Inner PO4 lokal um das Peptid; robust gegen Asymmetrien). Ohne Leaflet-Index (`index_leaflets.ndx`) wird die Trennung fallback-basiert aus der z-Verteilung abgeleitet.
+- Produktionsläufe nutzen keine Lipid-Z-Restraints (physikalisch realistischer Reorganisationsraum).
 
-### 7.1 MBAR-Analyse mit Bootstrap
+### 6.2 Resume, QC-only und Logging
+
+```bash
+# Resume: vorhandene Fenster werden übersprungen, Densify/Extend & QC laufen weiter
+python3 scripts/universal/08_run_pmf.py ${RUN_DIR} \
+  --replicate 1 \
+  --tag pmf_midplane \
+  --resume
+
+# QC-only: keine weitere MD — erzeugt nur Reports/Metadata aus vorhandenen Fenstern
+python3 scripts/universal/08_run_pmf.py ${RUN_DIR} \
+  --replicate 1 \
+  --tag pmf_midplane \
+  --qc-only
+
+# Outputs (pro Tag/Replicate):
+# ${RUN_DIR}/pmf/<tag>/run.log         # Laufprotokoll
+# ${RUN_DIR}/pmf/<tag>/qc_report.yaml  # QC-Zusammenfassung
+# ${RUN_DIR}/pmf/<tag>/pmf_metadata.yaml  # Metadaten für Analyse
+# ${RUN_DIR}/pmf/<tag>/RUN_INFO.yaml   # Provenienz (Git, Container, Env)
+```
+
+## Schritt 7: PMF-Analyse mit WHAM/MBAR
+
+### 7.1 WHAM (Standard) und MBAR (optional)
 
 ```bash
 # Analyse für jedes Replikat
 python3 scripts/analysis/pmf_mbar_analysis.py \
-  ${RUN_DIR}/pmf/replicate_1 \
+  ${RUN_DIR}/pmf/pmf_midplane \
+  --method wham \
+  --no-bootstrap 
+
+python3 scripts/analysis/pmf_mbar_analysis.py \
+  ${RUN_DIR}/pmf/pmf_midplane \
   --method mbar \
-  --bootstrap 1000
+  --no-bootstrap
 
 # Output:
 # - pmf_analysis_results.yaml    # Features & Metriken
@@ -247,6 +280,19 @@ python3 scripts/analysis/pmf_mbar_analysis.py \
 #   ├── pmf_profile.png          # PMF mit 95% CI
 #   ├── overlap_matrix.png       # Window-Overlap
 #   └── convergence.png          # Konvergenz-Check
+```
+
+```bash
+# Alternativ: Alle Replikate unter ${RUN_DIR}/pmf analysieren und aggregieren
+python3 scripts/analysis/pmf_mbar_analysis.py \
+  ${RUN_DIR}/pmf \
+  --method mbar \
+  --aggregate \
+  --bootstrap 0
+
+# Aggregate-Ausgabe:
+# - pmf/pmf_analysis_aggregate.yaml  # gemittelte Features + Replicate-Consistency
+# Pro Replikat weiter wie oben: pmf_analysis_results.yaml + analysis_plots/
 ```
 
 ### 7.2 Feature-Extraktion
@@ -386,13 +432,20 @@ python3 scripts/analysis/compare_replicates.py ${RUN_DIR}/pmf
 # config/pmf_standard_config.yaml
 pmf:
   umbrella:
-    ref_mode: "patch"      # Lokale Referenz!
-    patch_radius: 2.0      # nm
+    ref_mode: "midplane_local"   # Lokale Midplane-Referenz (balancierte Outer/Inner PO4)
+    patch_radius: 2.5      # nm (Radius für lokale Patch-Selektion)
     force_constant: 900    # kJ/mol/nm²
     production_ns: 20.0
+    lipid_z_posres: false  # keine Lipid-Z-Restraints in Produktion
   qc:
     min_neighbor_overlap: 0.10
     target_overlap: 0.20
+    min_ess_frames: 100
+    ess_stride: 5
+    max_extend_ns: 40.0
+  umbrella:
+    z_range:
+      dense_step: 0.10
 ```
 
 ## Wissenschaftliche Referenzen

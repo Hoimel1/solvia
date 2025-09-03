@@ -26,10 +26,16 @@ The SOLVIA repository has been transformed into a focused **PMF-based Toxpredict
 - **Solution**: SMD ladder for window preparation (5ns)
 - **File**: `scripts/universal/08_run_pmf_enhanced.py`
 
-### 5. **MBAR/WHAM Analysis** ✅
+### 5. **WHAM/MBAR Analysis** ✅
 - **Problem**: No analysis pipeline
-- **Solution**: Complete MBAR with bootstrap CIs
+- **Solution**: WHAM as standard with bootstrap CIs; MBAR optional
 - **File**: `scripts/analysis/pmf_mbar_analysis.py`
+  
+  New analysis config (config/pmf_standard_config.yaml under `pmf.analysis`):
+  - `mbar.fallback_policy`: `numeric_only` (default) | `strict` | `never`
+  - `bulk_detection.mode`: `auto` (default) | `fixed_z` | `percentile`
+  - `feature_params`: adaptive ranges (`ads_max_z`, `insert_min_z`)
+  - `qc`: `strict_mode`, `ergodicity_block_r_max`, `min_ergodicity_pass_fraction`, `js_divergence_max`, `min_js_pass_fraction`
 
 ### 6. **Quality Control System** ✅
 - **Problem**: No QC gates
@@ -47,7 +53,7 @@ scripts/universal/
 └── 08_run_pmf_enhanced.py         # Enhanced PMF with local patch
 
 scripts/analysis/
-├── pmf_mbar_analysis.py           # MBAR/WHAM analysis pipeline
+├── pmf_mbar_analysis.py           # WHAM/MBAR analysis pipeline
 └── pmf_qc_system.py               # Quality control system
 ```
 
@@ -135,7 +141,7 @@ The pipeline targets:
 4. **Equilibrate** (6.5 ns protocol)
 5. **Run PMF** (16-22 windows, 20 ns each)
 6. **Quality control** (automatic)
-7. **MBAR analysis** (with bootstrap)
+7. **WHAM analysis (standard)** (with bootstrap); MBAR optional
 
 ## 🔍 Quality Control
 
@@ -145,6 +151,9 @@ The pipeline includes automatic QC checks:
 - ESS: ≥200 frames
 - Convergence: ≤2 kJ/mol half-time
 - Replicate consistency: ≤2 kJ/mol
+- Ergodicity proxy (block stability R): ≤ 0.2 pass recommended
+- JS divergence (adjacent windows): ≤ 0.5 (≥80% adjacent pairs under threshold)
+- Strict mode: add `--strict-qc` or set `pmf.analysis.qc.strict_mode: true` to fail runs on threshold violations or JS+overlap consistency issues
 
 ## 📝 Publications
 

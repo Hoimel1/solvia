@@ -27,10 +27,12 @@ RUN wget -q https://ftp.gromacs.org/gromacs/gromacs-${GMX_VERSION}.tar.gz && \
     tar xzf gromacs-${GMX_VERSION}.tar.gz && \
     cd gromacs-${GMX_VERSION} && \
     mkdir build && cd build && \
+    # GMX_MPI=OFF → use thread-MPI; builds full toolchain including grompp
     cmake .. \
       -DGMX_BUILD_OWN_FFTW=ON \
       -DGMX_GPU=CUDA \
-      -DGMX_BUILD_MDRUN_ONLY=ON \
+      -DGMX_MPI=OFF \
+      -DGMX_BUILD_MDRUN_ONLY=OFF \
       -DGMXAPI=OFF \
       -DGMX_BUILD_NBLIB=OFF \
       -DGMX_BUILD_UNITTESTS=OFF \

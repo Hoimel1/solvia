@@ -1,8 +1,8 @@
 ;
 ;	File 'mdout.mdp' was generated
 ;	By user: unknown (1002)
-;	On host: ab1adabf5239
-;	At date: Wed Aug 27 22:59:47 2025
+;	On host: 12d487197dcf
+;	At date: Mon Sep  1 16:19:18 2025
 ;
 ;	Created by:
 ;	                     :-) GROMACS - gmx grompp, 2023.5 (-:
@@ -11,21 +11,21 @@
 ;	Data prefix:  /usr/local/gromacs
 ;	Working dir:  /work
 ;	Command line:
-;	  gmx grompp -f /work/simulations/solvia_1_run_1/pmf/pmf_local/windows/z_-2.000/umbrella.mdp -c /work/simulations/solvia_1_run_1/equilibration/npt/npt.gro -p /work/simulations/solvia_1_run_1/system/system_n1.top -n /work/simulations/solvia_1_run_1/pmf/pmf_local/windows/z_-2.000/index.ndx -o /work/simulations/solvia_1_run_1/pmf/pmf_local/windows/z_-2.000/umbrella.tpr -maxwarn 2
+;	  gmx grompp -f /work/simulations/solvia_12_run_1/equilibration/mdp/npt.mdp -c /work/simulations/solvia_12_run_1/equilibration/nvt/nvt.gro -p /work/simulations/solvia_12_run_1/system/system_n1.top -o /work/simulations/solvia_12_run_1/equilibration/npt/npt.tpr -maxwarn 2 -r /work/simulations/solvia_12_run_1/equilibration/nvt/nvt.gro -t /work/simulations/solvia_12_run_1/equilibration/nvt/nvt.cpt
 
 ; VARIOUS PREPROCESSING OPTIONS
 ; Preprocessor information: use cpp syntax.
 ; e.g.: -I/home/joe/doe -I/home/mary/roe
 include                  = 
 ; e.g.: -DPOSRES -DFLEXIBLE (note these variable names are case sensitive)
-define                   = -DPOSRES_LIPID_Z
+define                   = -DPOSRES
 
 ; RUN CONTROL PARAMETERS
 integrator               = md
 ; Start time and timestep in ps
 tinit                    = 0
 dt                       = 0.02
-nsteps                   = 1000000
+nsteps                   = 250000
 ; For exact run continuation or redoing part of a run
 init-step                = 0
 ; Part index is updated automatically on checkpointing (keeps files separate)
@@ -42,7 +42,7 @@ comm-grps                =
 ; LANGEVIN DYNAMICS OPTIONS
 ; Friction coefficient (amu/ps) and random seed
 bd-fric                  = 0
-ld-seed                  = 429572
+ld-seed                  = -1
 
 ; ENERGY MINIMIZATION OPTIONS
 ; Force tolerance and initial step-size
@@ -65,12 +65,12 @@ nstxout                  = 0
 nstvout                  = 0
 nstfout                  = 0
 ; Output frequency for energies to log file and energy file
-nstlog                   = 1000
+nstlog                   = 500
 nstcalcenergy            = 100
-nstenergy                = 1000
+nstenergy                = 500
 ; Output frequency and precision for .xtc file
-nstxout-compressed       = 1000
-compressed-x-precision   = 1000
+nstxout-compressed       = 500
+compressed-x-precision   = 100
 ; This selects the subset of atoms for the compressed
 ; trajectory file. You can select multiple groups. By
 ; default, all atoms will be written.
@@ -95,7 +95,7 @@ rlist                    = 1
 
 ; OPTIONS FOR ELECTROSTATICS AND VDW
 ; Method for doing electrostatics
-coulombtype              = reaction-field
+coulombtype              = Reaction-Field
 coulomb-modifier         = Potential-shift-Verlet
 rcoulomb-switch          = 0
 rcoulomb                 = 1.1
@@ -143,12 +143,12 @@ tc-grps                  = System
 tau-t                    = 1.0
 ref-t                    = 310
 ; pressure coupling     
-pcoupl                   = Parrinello-Rahman
+pcoupl                   = berendsen
 pcoupltype               = semiisotropic
 nstpcouple               = -1
 ; Time constant (ps), compressibility (1/bar) and reference P (bar)
 tau-p                    = 12.0
-compressibility          = 4.5e-5 0
+compressibility          = 0.0003 0.0003
 ref-p                    = 1.0 1.0
 ; Scaling of reference coordinates, No, All or COM
 refcoord-scaling         = No
@@ -171,14 +171,14 @@ annealing-temp           =
 ; GENERATE VELOCITIES FOR STARTUP RUN
 gen-vel                  = no
 gen-temp                 = 300
-gen-seed                 = -544289031
+gen-seed                 = -1654801
 
 ; OPTIONS FOR BONDS    
 constraints              = none
 ; Type of constraint algorithm
 constraint-algorithm     = lincs
 ; Do not constrain the start configuration
-continuation             = yes
+continuation             = no
 ; Use successive overrelaxation to reduce the number of shake iterations
 Shake-SOR                = no
 ; Relative tolerance of shake
@@ -209,43 +209,7 @@ wall-density             =
 wall-ewald-zfac          = 3
 
 ; COM PULLING          
-pull                     = yes
-; Cylinder radius for dynamic reaction force groups (nm)
-pull-cylinder-r          = 1.5
-pull-constr-tol          = 1e-06
-pull-print-com           = no
-pull-print-ref-value     = no
-pull-print-components    = no
-pull-nstxout             = 50
-pull-nstfout             = 50
-pull-pbc-ref-prev-step-com = yes
-pull-xout-average        = no
-pull-fout-average        = no
-; Number of pull groups 
-pull-ngroups             = 2
-; Number of pull coordinates
-pull-ncoords             = 1
-; Group and coordinate parameters
-pull-group1-name         = LocalPatch
-pull-group1-weights      = 
-pull-group1-pbcatom      = 0
-pull-group2-name         = Peptide
-pull-group2-weights      = 
-pull-group2-pbcatom      = 0
-pull-coord1-type         = umbrella
-pull-coord1-potential-provider = 
-pull-coord1-expression   = 
-pull-coord1-dx           = 1e-09
-pull-coord1-geometry     = direction
-pull-coord1-groups       = 1 2
-pull-coord1-dim          = Y Y Y
-pull-coord1-origin       = 0.0 0.0 0.0
-pull-coord1-vec          = 0 0 1
-pull-coord1-start        = no
-pull-coord1-init         = -1.9999999999999998
-pull-coord1-rate         = 0
-pull-coord1-k            = 900
-pull-coord1-kB           = 900
+pull                     = no
 
 ; AWH biasing          
 awh                      = no

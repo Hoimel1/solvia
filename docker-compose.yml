@@ -12,9 +12,15 @@ services:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - XDG_CACHE_HOME=/cache
-    runtime: nvidia
     working_dir: /work
     user: "${UID}:${GID}"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
 
   martinize:
     build:
@@ -44,11 +50,18 @@ services:
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
-    runtime: nvidia
     volumes:
       - .:/work
     working_dir: /work
     user: "${UID}:${GID}"
+    gpus: all
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
 
 volumes:
   colabfold_cache:

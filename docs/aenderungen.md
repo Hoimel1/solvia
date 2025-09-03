@@ -1,4 +1,4 @@
-Kurz gesagt: Dein Studien-Konzept verlangt saubere, lokal definierte z-Koordinaten, gut overlapende Umbrella-Fenster, reproduzierbare Replikate und anschließend MBAR/WHAM-Analysen für ΔG-Features. Das Script, so wie es jetzt ist, liefert dir das nicht zuverlässig. Hier sind die wichtigsten Bruchstellen – technisch präzise, mit Bezug auf das, was der Code tatsächlich tut:
+Kurz gesagt: Dein Studien-Konzept verlangt saubere, lokal definierte z-Koordinaten, gut overlapende Umbrella-Fenster, reproduzierbare Replikate und anschließend WHAM/MBAR-Analysen für ΔG-Features. Das Script, so wie es jetzt ist, liefert dir das nicht zuverlässig. Hier sind die wichtigsten Bruchstellen – technisch präzise, mit Bezug auf das, was der Code tatsächlich tut:
 
 Harte Konzept/Script-Mismatches
 	1.	Falscher „Bezugspunkt“ für z (global statt lokal)
@@ -23,8 +23,8 @@ Konzept: „schwache Harmonische Restraints“ auf die Membran-COM in z, um Drif
 Script: keine Positions-/COM-Restraints auf Lipide. Zwar ist der Pull-Koordinate relativ (Gruppe1 vs. Peptid), aber ohne z-Fixierung können langsame globalen Drifts/Undulationen die Histogramme verbreitern und die Overlap-Kontrolle verwässern.
 	6.	Analyse-Pipeline fehlt
 
-Konzept beruht auf MBAR/WHAM, Bootstrap-CIs, Feature-Ableitung (z_surf,min, z_head,min, z‡), QC-Metriken etc.
-Script generiert nur Fensterläufe. Es gibt keine Implementierung für MBAR/WHAM/Bootstrap/CI/Overlap-Matrizen/ESS-Schätzung → die entscheidenden ΔG-Features bekommst du so nicht (oder nur ad hoc außerhalb des Scripts).
+Konzept beruht auf WHAM/MBAR, Bootstrap-CIs, Feature-Ableitung (z_surf,min, z_head,min, z‡), QC-Metriken etc.
+Script generiert nur Fensterläufe. Es gibt keine Implementierung für WHAM/MBAR/Bootstrap/CI/Overlap-Matrizen/ESS-Schätzung → die entscheidenden ΔG-Features bekommst du so nicht (oder nur ad hoc außerhalb des Scripts).
 
 Qualitäts- und Robustheitsprobleme im Detail
 	7.	Leaflet-Erkennung & „Upper/Lower“ Zuteilung
@@ -54,7 +54,7 @@ Was konkret geändert werden müsste (Kurz-Checkliste)
 	•	Fenster-Initialisierung: Stepped SMD/“umbrella pre-path“ generieren, und pro Fenster ein vorrelaxiertes Frame speichern statt „snap to init“.
 	•	Abdeckung & k: Tieferer z-Bereich (z.B. bis −2.0…−2.5 nm, abhängig von Chol/SM-Anteil), k anpassen (900–1200), adaptive Verdichtung über reale Overlap-Metriken (nicht nur σ=√(kT/k)).
 	•	z-Fix für Membran: schwache COM-z-Restraints auf Lipide implementieren (wie im Konzept).
-	•	QC & Analyse: Eigene Pipeline (MBAR/WHAM, Block-Bootstrap, ESS, Overlap-Heatmaps, Halbzeit-Checks, Replikat-Vergleich) implementieren; die Script-Option --write-meta ist dafür nicht ausreichend.
+	•	QC & Analyse: Eigene Pipeline (WHAM/MBAR, Block-Bootstrap, ESS, Overlap-Heatmaps, Halbzeit-Checks, Replikat-Vergleich) implementieren; die Script-Option --write-meta ist dafür nicht ausreichend.
 	•	Leaflet-Labeling: „Outer“ hart definieren (Topologie/initiale Zuordnung), nicht „auto“.
 
 Solange diese Punkte ungelöst sind, wird das Script dir keine robusten ΔGads/ΔGinsert/ΔG‡ liefern, die die geforderte Korrelation (ρ≥0.5) oder AUC (≥0.80) belastbar erreichen – nicht, weil das Konzept grundsätzlich falsch wäre, sondern weil die operationalisierte Koordinate, Startprozedur und QC im aktuellen Script die zentrale Annahme („1D-PMF spiegelt hämolytische Tendenz zuverlässig“) unterlaufen.
@@ -120,7 +120,7 @@ Abbruchregeln pro Peptid
 	•	Wenn nach Nachbesserungen ≥2 QC-Kriterien weiterhin scheitern → „nicht auswertbar“.
 
 5) Analyse-SOP (einheitlich)
-	•	PMF via MBAR; WHAM nur als QA-Spiegel.
+	•	PMF via WHAM (Standard); MBAR optional als QA/Ergänzung.
 	•	Bulk-Null setzt Script aus z ≥ +2.4 nm.
 	•	Glättung: PCHIP auf 0.01-nm-Grid (nur zur Extrempunkt-Bestimmung).
 	•	Features: ΔG_ads, ΔG_insert, ΔG‡, z_surf,min, z_head,min, z‡.

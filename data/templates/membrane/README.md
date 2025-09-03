@@ -15,7 +15,7 @@ Evidence-based asymmetric red blood cell (RBC) membrane model for SOLVIA hemolyt
 - CHOL: 40%
 
 ## Parameters
-- Box size: 10 x 10 x 14 nm
+- Box size: 12 x 12 x 14 nm
 - Membrane thickness: ~4.5 nm
 - Salt concentration: 0.15 M (NaCl)
 - Total cholesterol: ~40-45 mol%
