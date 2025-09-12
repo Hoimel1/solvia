@@ -14,6 +14,84 @@ SOLVIA ist eine **vollständig containerisierte** Pipeline zur Vorhersage der h�
 ColabFold → Martinize2 → INSANE → GROMACS → PMF/Umbrella → WHAM (Standard) / MBAR → Toxizitätsklassifikation
 ```
 
+## Reproduzierbare Standard-Pipeline (empfohlen)
+
+```bash
+# 0) Optional: RBC-Membran-Template einmalig erstellen (validierte Asymmetrie)
+python3 scripts/universal/04_build_membrane.py --global-template
+
+# 1) Run-Verzeichnis anlegen (Beispiel: SOLVIA_1)
+python3 scripts/universal/01_setup_run.py data/raw/fasta/SOLVIA_1.fasta
+
+# 2) ColabFold (siehe Abschnitt 1.2), danach bestes Modell wählen
+python3 scripts/universal/02_run_colabfold.py simulations/solvia_8_run_1
+
+# 3) Coarse-Graining (ITP-Aufbereitung inkl. PosRes)
+python3 scripts/universal/03_coarse_grain.py simulations/solvia_8_run_1
+
+# 4) Peptid-Insertion (2 Replikate, evidenzbasiert)
+# Rep 1: parallel; Rep 2: kontinuierliche Neigung + Roll
+python3 scripts/universal/05_insert_peptides.py simulations/solvia_1_run_1 \
+  --n-peptides 1 --orientation parallel
+python3 scripts/universal/05_insert_peptides.py simulations/solvia_1_run_1 \
+  --n-peptides 1 --orientation continuous
+
+# 5) Equilibrierung (Standard)
+python3 scripts/universal/06_equilibrate.py simulations/solvia_1_run_1 --tag pmf_rep1
+
+# 6) PMF/Umbrella pro Replikat (60 ns Fenster, QC/Auto-Densify gemäß Config)
+python3 scripts/universal/08_run_pmf.py simulations/solvia_1_run_1 --replicate 1
+python3 scripts/universal/08_run_pmf.py simulations/solvia_1_run_1 --replicate 2
+
+# 7) Analyse (WHAM Standard, reproduzierbar ohne Bootstrap; Replikate aggregieren)
+python3 scripts/analysis/pmf_mbar_analysis.py \
+  simulations/solvia_1_run_1/pmf \
+  --method wham \
+  --aggregate \
+  --no-bootstrap
+
+### Optional: Regionale QC-Schwellen und Auto-Stride
+
+In `config/pmf_standard_config.yaml` können regionenabhängige QC-Grenzen und ein automatischer ESS‑Stride aktiviert werden. Beispiel (Drop‑in, nur relevante Keys):
+
+```
+pmf:
+  qc:
+    # global defaults (werden von region_thresholds überschrieben)
+    min_neighbor_overlap: 0.20
+    min_ess_frames: 200
+    half_energy_tol_kj: 2.0
+    half_z_tol_sigma: 2.0
+    discard_fraction: 0.1
+    ess_stride: "auto"       # automatisch: ~0.2 * tau_int als Abtastabstand
+    region_thresholds:
+      bulk:
+        min_neighbor_overlap: 0.12
+        min_ess_frames: 150
+        half_energy_tol_kj: 3.0
+        half_z_tol_sigma: 2.5
+        min_time_ns: 20
+      approach:
+        min_neighbor_overlap: 0.15
+        min_ess_frames: 200
+        half_energy_tol_kj: 2.0
+        half_z_tol_sigma: 2.0
+        min_time_ns: 30
+      interface:
+        min_neighbor_overlap: 0.20
+        min_ess_frames: 300
+        half_energy_tol_kj: 1.0
+        half_z_tol_sigma: 1.5
+        min_time_ns: 40
+```
+```
+
+Hinweise:
+- Membran: validierte RBC-Asymmetrie mit ~42% CHOL ist per Default aktiv; Leaflets werden per Index (`index_leaflets.ndx`) definiert.
+- PMF: 60 ns/Fenster; QC/Auto‑Densify/Extend gemäß `config/pmf_standard_config.yaml`.
+- Analyse: WHAM ist robust und deterministisch (ohne Bootstrap). MBAR optional (`--method mbar`).
+- Reproduzierbarkeit: Seeds für Replikate sind deterministisch; Bootstrap ist per Default deaktiviert.
+
 ## Voraussetzungen
 
 - Docker und Docker Compose (für ColabFold und Martinize2)
@@ -31,7 +109,7 @@ ColabFold → Martinize2 → INSANE → GROMACS → PMF/Umbrella → WHAM (Stand
 cd /home/michelhuller/solvia
 
 # Run-Setup für einzelnes Peptid
-python3 scripts/universal/01_setup_run.py data/raw/fasta/SOLVIA_12.fasta
+python3 scripts/universal/01_setup_run.py data/raw/fasta/SOLVIA_1.fasta
 
 # Struktur:
 # simulations/solvia_1_run_1/
@@ -43,7 +121,7 @@ python3 scripts/universal/01_setup_run.py data/raw/fasta/SOLVIA_12.fasta
 
 ```bash
 # Variable für Run-Verzeichnis
-RUN_DIR="simulations/solvia_12_run_1"
+RUN_DIR="simulations/solvia_32_run_1"
 
 # ColabFold für Strukturvorhersage
 docker compose run --rm \
@@ -131,23 +209,47 @@ insane \
 
 ### 4.1 PMF-optimierte Insertion mit Replikaten
 
+Evidenzbasiert empfehlen wir eine Kombination aus paralleler und leicht geneigter Startlage mit azimutalem “Rolling”, um Orientierungsbias zu reduzieren und robuste z‑PMFs zu erhalten.
+
+Option A — Ein Replikat (robuster Einzel‑Run)
+
 ```bash
-# Single Peptide für PMF (Standard)
+# Kontinuierliche Neigung (Tilt ~ N(30°, 20°) in [0°,90°]),
+# Roll (Azimut) ~ U(0,360°):
 python3 scripts/universal/05_insert_peptides.py ${RUN_DIR} \
   --n-peptides 1 \
-  --orientation parallel
-
-# Alternative: Mit verschiedenen Orientierungen für Replikate
-# Replikat 1: Parallel
-python3 scripts/universal/05_insert_peptides.py ${RUN_DIR} \
-  --n-peptides 1 \
-  --orientation parallel
-
-# Replikat 2: 45° Neigung
-python3 scripts/universal/05_insert_peptides.py ${RUN_DIR} \
-  --n-peptides 1 \
-  --orientation tilt45
+  --orientation continuous
 ```
+
+Option B — Zwei Replikate (empfohlen)
+
+```bash
+# Replikat 1: Parallel (0° Tilt), roll wird in der Dynamik variiert
+python3 scripts/universal/05_insert_peptides.py ${RUN_DIR} \
+  --n-peptides 1 \
+  --orientation parallel
+
+# Replikat 2: Kontinuierliche Neigung + Roll (siehe oben)
+python3 scripts/universal/05_insert_peptides.py ${RUN_DIR} \
+  --n-peptides 1 \
+  --orientation continuous
+```
+
+Mehrere Peptide (Poisson‑Sampling mit kooperativer Entzerrung)
+
+```bash
+# 8 Peptide mit Poisson‑Disk‑Sampling (XY) und MC‑Entzerrung (“cooperative”)
+python3 scripts/universal/05_insert_peptides.py ${RUN_DIR} \
+  --n-peptides 8 \
+  --placement cooperative \
+  --orientation continuous
+```
+
+Hinweise:
+
+- `--orientation continuous` sampelt Tilt kontinuierlich (um 30°) und Roll uniform (0–360°).
+- Für einzelne Peptide reicht `--placement poisson` (Default). Bei mehreren Peptiden verbessert `--placement cooperative` die Startabstände (keine Überschneidungen, realistischere Nachbarschaften).
+- Seeds sind deterministisch pro Replikat (über Run‑Infos), Replikate unterscheiden sich in Orientierung/Platzierung.
 
 **Features:**
 - Single Peptide für PMF-Studien

@@ -700,8 +700,8 @@ def create_system_topology(run_dir, peptide_id, n_peptides, tag, config_path=Non
 #include "{config['directories']['force_fields']}/martini_v3.0.0_solvents_v1.itp"
 #include "{config['directories']['force_fields']}/martini_v3.0.0_ions_v1.itp"
 
-; Include peptide topology
-#include "../coarse_grain/{peptide_id}.itp"
+; Include peptide topology (centralized in force_fields)
+#include "{config['directories']['force_fields']}/{peptide_id}.itp"
 
 [ system ]
 {n_peptides} {peptide_id} peptides in RBC membrane

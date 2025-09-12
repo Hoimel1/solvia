@@ -5,20 +5,20 @@ Evidence-based asymmetric red blood cell (RBC) membrane model for SOLVIA hemolyt
 
 ## Composition
 ### Upper Leaflet (Outer)
-- POPC: 40%
-- PSM: 15%
-- CHOL: 45%
+- POPC: 30%
+- PSM: 27%
+- CHOL: 42%
 
 ### Lower Leaflet (Inner)
-- POPE: 45%
-- POPS: 15%
-- CHOL: 40%
+- POPE: 29%
+- POPS: 20%
+- CHOL: 42%
 
 ## Parameters
-- Box size: 12 x 12 x 14 nm
+- Box size: 14 x 14 x 14 nm
 - Membrane thickness: ~4.5 nm
 - Salt concentration: 0.15 M (NaCl)
-- Total cholesterol: ~40-45 mol%
+- Total cholesterol: ~25-35 mol%
 
 ## Evidence Base
 Based on literature values for human RBC membranes:

@@ -2,17 +2,19 @@
 
 [ system ]
 ; name
-INSANE! Membrane UpperLeaflet>POPC:PSM:CHOL=0.4:0.15:0.45 LowerLeaflet>POPE:POPS:CHOL=0.45:0.15:0.4
+INSANE! Membrane UpperLeaflet>CHOL:POPC:PSM:POPS=0.42:0.3:0.27:0.01 LowerLeaflet>CHOL:POPE:POPS:POPC=0.42:0.293:0.2:0.087
 
 
 [ molecules ]
 ; name  number
-POPC            90
-PSM             33
-CHOL           101
-POPE           101
-POPS            33
-CHOL            90
-W            11753
-NA             146
-CL             113
+CHOL           136
+POPC            97
+PSM             87
+POPS             3
+CHOL           136
+POPE            94
+POPS            64
+POPC            28
+W            15762
+NA             207
+CL             140

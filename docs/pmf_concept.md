@@ -220,3 +220,26 @@ Standardisierung (SOP) – Umsetzung in der Pipeline
 • Output: Pull-Coordinate/Force ≤1 ps; QC-Gates automatisch enforced (Overlap, ESS, Halbzeit, Replikat).
 • Analyse: WHAM primär; MBAR optional/QA; PCHIP (0.01 nm) nur zur Extrempunkt‑Bestimmung; präzisionsgewichtete Replikat‑Mittel.
 • Reporting: QC-Report (Overlap-Heatmap, ESS, Halbzeit, R1/R2), PMF mit 95%-Band, Feature-Tabelle.
+
+python3 scripts/universal/02_run_colabfold.py
+
+python3 scripts/universal/02_run_colabfold.py simulations/solvia_8_run_1
+python3 scripts/universal/02_run_colabfold.py simulations/solvia_14_run_1
+python3 scripts/universal/02_run_colabfold.py simulations/solvia_32_run_1
+python3 scripts/universal/02_run_colabfold.py simulations/solvia_68_run_1
+python3 scripts/universal/02_run_colabfold.py simulations/solvia_126_run_1
+python3 scripts/universal/02_run_colabfold.py simulations/solvia_164_run_1
+python3 scripts/universal/02_run_colabfold.py simulations/solvia_215_run_1
+python3 scripts/universal/02_run_colabfold.py simulations/solvia_482_run_1
+python3 scripts/universal/02_run_colabfold.py simulations/solvia_490_run_1
+python3 scripts/universal/02_run_colabfold.py simulations/solvia_515_run_1
+python3 scripts/universal/02_run_colabfold.py simulations/solvia_524_run_1
+python3 scripts/universal/02_run_colabfold.py simulations/solvia_527_run_1
+python3 scripts/universal/02_run_colabfold.py simulations/solvia_617_run_1
+python3 scripts/universal/02_run_colabfold.py simulations/solvia_624_run_1
+python3 scripts/universal/02_run_colabfold.py simulations/solvia_850_run_1
+python3 scripts/universal/02_run_colabfold.py simulations/solvia_858_run_1
+python3 scripts/universal/02_run_colabfold.py simulations/solvia_941_run_1
+python3 scripts/universal/02_run_colabfold.py simulations/solvia_974_run_1
+python3 scripts/universal/02_run_colabfold.py simulations/solvia_1023_run_1
+python3 scripts/universal/02_run_colabfold.py simulations/solvia_1045_run_1

@@ -460,6 +460,10 @@ def run_grompp(mdp_file, coord_file, top_file, output_tpr,
         "-o", f"/work/{rel_tpr}",
         "-maxwarn", str(maxwarn)
     ]
+    # Add include paths so local and centralized ITPs resolve cleanly
+    # Always include force_fields and the run's coarse_grain directory
+    # Note: GROMACS 2023.5 does not support -I on grompp. We rely on absolute
+    # include paths in generated .top files instead.
     
     if ref_file:
         rel_ref = os.path.relpath(ref_file, project_root)

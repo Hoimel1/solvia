@@ -1,21 +1,27 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 """
 SOLVIA PMF Analysis Pipeline with MBAR/WHAM
 Implements robust PMF analysis with bootstrap confidence intervals
 """
 
-import os
 import sys
 import yaml
 import numpy as np
-import pandas as pd
+from typing import Optional
+import matplotlib
+# Force non-interactive backend for headless/CI execution
+try:
+    matplotlib.use('Agg', force=True)
+except Exception:
+    # Safe fallback; plotting will still attempt default backend
+    pass
 import matplotlib.pyplot as plt
 from pathlib import Path
 import argparse
 from scipy.interpolate import PchipInterpolator
 from scipy import integrate
-import warnings
-warnings.filterwarnings('ignore')
+ 
 from scipy.special import logsumexp
 
 # Try to import pymbar
@@ -33,15 +39,8 @@ class PMFAnalyzer:
     def __init__(self, pmf_dir, config=None):
         self.pmf_dir = Path(pmf_dir)
         
-        # Set config first
-        if config is None:
-            self.config = {}
-        else:
-            self.config = config
-        
-        # Set grid spacing and bulk min from config if present
-        self.grid_spacing = self.config.get('smoothing', {}).get('grid_spacing', 0.01)
-        self.bulk_min = self.config.get('z_bulk_min_nm', 2.4)
+        # Stash provided config (final config is set after metadata load)
+        self.config = config if config is not None else {}
         # Try different locations for metadata file
         possible_metadata_files = []
         
@@ -106,77 +105,24 @@ class PMFAnalyzer:
                 print(f"  ... and {len(unique_paths) - 10} more locations")
             raise FileNotFoundError(f"PMF metadata not found. Please ensure pmf_metadata.yaml exists in one of the searched locations.")
         
-        # Load metadata - handle numpy objects in YAML
+        # Load metadata strictly via YAML
         with open(self.metadata_file, 'r') as f:
-            content = f.read()
-            
-            # First, try safe_load
             try:
-                self.metadata = yaml.safe_load(content)
-            except Exception:
-                # If fails due to numpy objects, parse manually
-                self.metadata = {}
-                
-                # Parse key fields manually from the YAML
-                import re
-                
-                # Extract force constant
-                match = re.search(r'^force_constant:\s*(\d+)', content, re.MULTILINE)
-                if match:
-                    self.metadata['force_constant'] = int(match.group(1))
-                
-                # Extract n_windows
-                match = re.search(r'^n_windows:\s*(\d+)', content, re.MULTILINE)
-                if match:
-                    self.metadata['n_windows'] = int(match.group(1))
-                
-                # Extract production_time
-                match = re.search(r'^production_time:\s*([\d.]+)', content, re.MULTILINE)
-                if match:
-                    self.metadata['production_time'] = float(match.group(1))
-                
-                # Extract window information
-                self.metadata['windows'] = []
-                lines = content.split('\n')
-                for i, line in enumerate(lines):
-                    if line == 'windows:':
-                        # Parse the windows list
-                        j = i + 1
-                        current_window = None
-                        while j < len(lines):
-                            if lines[j].startswith('- center:'):
-                                if current_window:
-                                    self.metadata['windows'].append(current_window)
-                                current_window = {}
-                                center_match = re.search(r'center:\s*([-.\deE]+)', lines[j])
-                                if center_match:
-                                    current_window['center'] = float(center_match.group(1))
-                            elif lines[j].startswith('  pullf:'):
-                                if current_window:
-                                    current_window['pullf'] = lines[j].split('pullf:')[1].strip()
-                            elif lines[j].startswith('  pullx:'):
-                                if current_window:
-                                    current_window['pullx'] = lines[j].split('pullx:')[1].strip()
-                            elif lines[j].startswith('  tpr:'):
-                                if current_window:
-                                    current_window['tpr'] = lines[j].split('tpr:')[1].strip()
-                            elif not lines[j].startswith(' ') and not lines[j].startswith('-'):
-                                # End of windows section
-                                if current_window:
-                                    self.metadata['windows'].append(current_window)
-                                break
-                            j += 1
-                        break
+                self.metadata = yaml.safe_load(f)
+            except Exception as e:
+                raise RuntimeError(f"Failed to parse YAML metadata: {self.metadata_file}: {e}")
         
         # Update pmf_dir to the directory containing metadata
         self.pmf_dir = self.metadata_file.parent
         
+        # Final config then derive parameters
         self.config = config or self.load_analysis_config()
-        self.windows = self.metadata['windows']
-        self.k = self.metadata.get('force_constant', 900)  # kJ/mol/nm^2
-        self.temperature = 310  # K
-        self.kb = 0.008314462618  # kJ/mol/K
-        self.beta = 1.0 / (self.kb * self.temperature)
+        self.windows = self.metadata.get('windows', [])
+        self.k = float(self.metadata.get('force_constant', 900))  # kJ/mol/nm^2
+        temp_cfg = ((self.config.get('simulation') or {}).get('temperature')) if isinstance(self.config.get('simulation', {}), dict) else None
+        self.temperature = float(self.metadata.get('temperature', temp_cfg if temp_cfg is not None else 310.0))
+        self.R = 0.008314462618  # kJ/mol/K
+        self.beta = 1.0 / (self.R * self.temperature)
         # Time filtering options
         tf = (self.config or {}).get('time_filter', {})
         self.begin_ps = tf.get('begin_ps', None)
@@ -199,6 +145,18 @@ class PMFAnalyzer:
         self.wham_adaptive_passes = int(adapt_cfg.get('max_refine_passes', 1))
         # Symmetrization (optional)
         self.symmetrize = bool((self.config or {}).get('symmetrize', False))
+        # Ensure grid spacing and bulk come from final config
+        self.grid_spacing = (self.config.get('smoothing') or {}).get('grid_spacing', 0.01)
+        self.bulk_min = self.config.get('z_bulk_min_nm', 2.4)
+        # Optional bootstrap seed for reproducibility (use local RNG)
+        bs_seed = ((self.config.get('bootstrap') or {}).get('seed')) if isinstance(self.config.get('bootstrap', {}), dict) else None
+        seed_val = None
+        if bs_seed is not None:
+            try:
+                seed_val = int(bs_seed)
+            except Exception:
+                seed_val = None
+        self.rng = np.random.default_rng(seed_val)
         # QC/validation defaults
         qc_cfg = (self.config.get('qc') or {})
         self.ergodicity_block_r_max = float(qc_cfg.get('ergodicity_block_r_max', 0.2))
@@ -342,7 +300,7 @@ class PMFAnalyzer:
             ess_list.append(len(d) / g)
         return np.array(g_list, dtype=float), np.array(ess_list, dtype=float)
 
-    def _detect_bulk_mask(self, z_centers: np.ndarray, pmf: np.ndarray, counts: np.ndarray | None = None):
+    def _detect_bulk_mask(self, z_centers: np.ndarray, pmf: np.ndarray, counts: Optional[np.ndarray] = None):
         """Detect a plateau region at large z to define bulk normalization.
 
         Criteria:
@@ -355,8 +313,7 @@ class PMFAnalyzer:
         g = np.asarray(pmf)
         if z.size < 3:
             return z >= getattr(self, 'bulk_min', 2.4)
-        # approximate gradient
-        dz = np.gradient(z)
+        # approximate gradient of PMF vs z
         dg = np.gradient(g, z)
         ok = np.abs(dg) <= self.bulk_grad_thresh
         if counts is not None:
@@ -382,12 +339,14 @@ class PMFAnalyzer:
         # Map back to original order
         mask_unsorted = np.zeros_like(mask_out)
         mask_unsorted[idx_sorted] = mask_out
-        # Fallback
+        # Fallback: require both z >= bulk_min and sufficient counts if provided
         if not np.any(mask_unsorted):
+            if counts is not None:
+                return np.logical_and(z >= getattr(self, 'bulk_min', 2.4), np.asarray(counts) >= self.bulk_min_count)
             return z >= getattr(self, 'bulk_min', 2.4)
         return mask_unsorted
 
-    def _bulk_mask(self, z_centers: np.ndarray, pmf: np.ndarray, counts: np.ndarray | None = None):
+    def _bulk_mask(self, z_centers: np.ndarray, pmf: np.ndarray, counts: Optional[np.ndarray] = None):
         """Flexible bulk-region detection with config options.
 
         bulk_detection config options:
@@ -474,7 +433,7 @@ class PMFAnalyzer:
         mbar_cfg = (self.config.get('mbar') or {})
         max_iter = int(mbar_cfg.get('max_iterations', 5000))
         rel_tol = float(mbar_cfg.get('relative_tolerance', 1e-7))
-        solver = mbar_cfg.get('solver_protocol', 'robust')  # avoid 'hybr' stalls
+        # Use a conservative, broadly supported initialization
         try:
             mbar = MBAR(
                 u_kn,
@@ -482,11 +441,10 @@ class PMFAnalyzer:
                 maximum_iterations=max_iter,
                 relative_tolerance=rel_tol,
                 verbose=False,
-                initialize='BAR',
-                solver_protocol=solver,
+                initialize='zeros',
             )
         except Exception as e:
-            print(f"Warning: BAR initialization failed ({e}), trying zeros...")
+            print(f"Warning: MBAR(init=zeros) failed ({e}), trying default...")
             try:
                 mbar = MBAR(
                     u_kn,
@@ -494,20 +452,12 @@ class PMFAnalyzer:
                     maximum_iterations=max_iter,
                     relative_tolerance=rel_tol,
                     verbose=False,
-                    initialize='zeros',
-                    solver_protocol=solver,
                 )
             except Exception as e2:
-                print(f"Warning: zeros initialization failed ({e2}), using default...")
+                print(f"Warning: MBAR default init failed ({e2}), using minimal constructor...")
                 mbar = MBAR(u_kn, N_k, verbose=False)
         print("[MBAR] Solver finished.")
-        
-        # Calculate PMF on a grid
-        z_min = min(d.min() for d in data)
-        z_max = max(d.max() for d in data)
-        n_points = int((z_max - z_min + 0.4) / self.grid_spacing)
-        z_grid = np.linspace(z_min - 0.2, z_max + 0.2, max(n_points, 10))
-        n_bins = len(z_grid)
+        mbar_converged = getattr(mbar, 'converged', True)
         
         # Compute PMF using MBAR weights and a weighted histogram over z
         # 1) Reduced free energies of windows (dimensionless)
@@ -519,45 +469,78 @@ class PMFAnalyzer:
         w_n = 1.0 / (denom + 1e-300)
         
         # 3) Probability density along z using MBAR expectations
-        # Build fixed histogram grid
+        # Build fixed histogram grid and trim to contiguous support region
         z_min = min(d.min() for d in data)
         z_max = max(d.max() for d in data)
-        z_edges = np.arange(z_min - 0.2, z_max + 0.2 + self.grid_spacing, self.grid_spacing)
+        n_bins = int(max(10, (z_max - z_min + 0.4) / self.grid_spacing))
+        z_edges = np.linspace(z_min - 0.2, z_max + 0.2, n_bins + 1)
         z_centers = (z_edges[:-1] + z_edges[1:]) / 2.0
         nb = len(z_edges) - 1
-        # Indicator observables per bin: A_i(n) = 1 if z_n in bin i else 0
+
+        # Assign samples to bins and get raw counts
         inds = np.digitize(all_data, z_edges) - 1
         inds = np.clip(inds, 0, nb - 1)
-        A = np.zeros((nb, all_data.shape[0]), dtype=float)
-        for i in range(nb):
-            mask_i = (inds == i)
-            if mask_i.any():
-                A[i, mask_i] = 1.0
-        # Expectation at unbiased target state (u_n = 0)
-        try:
-            res = mbar.compute_multiple_expectations(A, u_n=np.zeros_like(all_data), compute_uncertainty=False)
-            p = res['mu']
-        except Exception:
-            # Fallback: use weights-based histogram if expectations fail
-            hist, _ = np.histogram(all_data, bins=z_edges, weights=w_n)
-            p = hist / (hist.sum() + 1e-300)
+        counts_all = np.bincount(inds, minlength=nb)
+
+        # Define a support mask based on minimum counts for stability; fallback to >0
+        plot_cfg = (self.config.get('plot') or {})
+        min_count_pmf = int(plot_cfg.get('pmf_min_bin_count', plot_cfg.get('min_bin_count_for_ci', 25)))
+        mask_good = (counts_all >= min_count_pmf)
+        if not mask_good.any():
+            # Fallback: use non-zero support
+            mask_good = (counts_all > 0)
+
+        # Keep the longest contiguous True block to avoid sparse tails
+        if mask_good.any():
+            m = mask_good.astype(np.int8)
+            diff = np.diff(np.concatenate(([0], m, [0])))
+            starts = np.where(diff == 1)[0]
+            ends = np.where(diff == -1)[0] - 1
+            if len(starts):
+                i_long = int(np.argmax(ends - starts + 1))
+                keep = slice(starts[i_long], ends[i_long] + 1)
+            else:
+                keep = slice(0, nb)
+        else:
+            keep = slice(0, nb)
+
+        # Trim grid and reindex
+        z_edges = z_edges[keep.start: keep.stop + 1]
+        z_centers = (z_edges[:-1] + z_edges[1:]) / 2.0
+        nb = len(z_edges) - 1
+        inds = np.clip(inds - keep.start, 0, nb - 1)
+        counts_all = counts_all[keep]
+
+        # Use direct weighted histogram from MBAR weights (robust across PyMBAR versions)
+        hist, _ = np.histogram(all_data, bins=z_edges, weights=w_n)
+        p = hist / (hist.sum() + 1e-300)
         # Avoid log(0) by clipping
         p = np.clip(p, 1e-300, 1.0)
         # PMF (dimensionless) then convert to kJ/mol
         pmf = -np.log(p)
         pmf = pmf / self.beta
-        # Normalize PMF by detected bulk plateau or fallback
-        counts_all, _ = np.histogram(all_data, bins=z_edges)
+        # Normalize PMF by detected bulk plateau or fallback (use trimmed counts)
+        # counts_all already computed on the trimmed grid above
+        # Only normalize using bins with sufficient support
+        support = counts_all >= self.bulk_min_count
         if getattr(self, 'auto_bulk', True):
             bulk_mask = self._bulk_mask(z_centers, pmf, counts_all)
         else:
             bulk_mask = z_centers >= getattr(self, 'bulk_min', 2.4)
+        bulk_mask = np.logical_and(bulk_mask, support)
         if np.any(bulk_mask):
             pmf = pmf - pmf[bulk_mask].mean()
-        elif len(pmf) >= 10:
-            pmf = pmf - pmf[-10:].mean()
         else:
-            pmf = pmf - pmf.mean()
+            # Fallback: use top 10% highest z among supported bins
+            if np.any(support):
+                z_sup = z_centers[support]
+                thresh = np.percentile(z_sup, 90.0)
+                # Map back to full mask
+                mask_top = np.logical_and(support, z_centers >= thresh)
+                pmf = pmf - pmf[mask_top].mean()
+            else:
+                # Last resort: subtract median to avoid huge offsets
+                pmf = pmf - np.median(pmf)
 
         # Optional symmetrization for reporting
         if self.symmetrize:
@@ -584,31 +567,67 @@ class PMFAnalyzer:
                 for k_idx, d in enumerate(data):
                     d_use = d[::thin] if thin > 1 else d
                     if bs_method in ('block', 'blocks', 'blocked'):
-                        bl = int(max(2, round(g_k[k_idx])))
+                        bl = int(max(2, round(2.0 * g_k[k_idx])))
                         if bl >= len(d_use):
-                            idx = np.random.choice(len(d_use), len(d_use), replace=True)
+                            idx = self.rng.choice(len(d_use), len(d_use), replace=True)
                             boot_data.append(d_use[idx])
                         else:
                             # Non-overlapping block bootstrap (NBB)
                             blocks = [d_use[i:i+bl] for i in range(0, len(d_use), bl)]
                             n_blocks = max(1, int(np.ceil(len(d_use) / bl)))
-                            sel = np.random.choice(len(blocks), n_blocks, replace=True)
+                            sel = self.rng.choice(len(blocks), n_blocks, replace=True)
                             series = np.concatenate([blocks[i] for i in sel])
                             series = series[:len(d_use)]
                             boot_data.append(series)
+                    elif bs_method in ('stationary', 'stationary_bootstrap', 'sb'):
+                        L_mean = max(2, int(round(g_k[k_idx])))
+                        boot_series = self._stationary_bootstrap(d_use, L_mean)
+                        boot_data.append(boot_series)
                     else:
-                        idx = np.random.choice(len(d_use), len(d_use), replace=True)
+                        idx = self.rng.choice(len(d_use), len(d_use), replace=True)
                         boot_data.append(d_use[idx])
 
-                # Calculate PMF for bootstrap sample
+                # Calculate PMF for bootstrap sample on fixed z grid
                 try:
-                    pmf_boot = self.calculate_mbar(boot_data, centers, bootstrap=False)[1]
-                    pmf_bootstrap.append(pmf_boot)
+                    all_boot = np.concatenate(boot_data)
+                    N_k_boot = np.array([len(d) for d in boot_data], dtype=int)
+                    u_kn_boot = 0.5 * self.k * self.beta * (centers[:, None] - all_boot[None, :])**2
+                    try:
+                        mbar_boot = MBAR(
+                            u_kn_boot,
+                            N_k_boot,
+                            maximum_iterations=int((self.config.get('mbar') or {}).get('max_iterations', 5000)),
+                            relative_tolerance=float((self.config.get('mbar') or {}).get('relative_tolerance', 1e-7)),
+                            verbose=False,
+                            initialize='zeros'
+                        )
+                    except Exception:
+                        mbar_boot = MBAR(u_kn_boot, N_k_boot, verbose=False)
+                    logs_b = (np.log(N_k_boot + 1e-300)[:, None] + mbar_boot.f_k[:, None] - u_kn_boot)
+                    denom_b = np.exp(logsumexp(logs_b, axis=0))
+                    w_n_b = 1.0 / (denom_b + 1e-300)
+                    # Weighted histogram directly via MBAR weights for bootstrap sample
+                    hist_b, _ = np.histogram(all_boot, bins=z_edges, weights=w_n_b)
+                    p_b = hist_b / (hist_b.sum() + 1e-300)
+                    p_b = np.clip(p_b, 1e-300, 1.0)
+                    pmf_b = -np.log(p_b) / self.beta
+                    counts_b, _ = np.histogram(all_boot, bins=z_edges)
+                    if getattr(self, 'auto_bulk', True):
+                        bulk_mask_b = self._bulk_mask(z_centers, pmf_b, counts_b)
+                    else:
+                        bulk_mask_b = z_centers >= getattr(self, 'bulk_min', 2.4)
+                    if np.any(bulk_mask_b):
+                        pmf_b = pmf_b - pmf_b[bulk_mask_b].mean()
+                    elif len(pmf_b) >= 10:
+                        pmf_b = pmf_b - pmf_b[-10:].mean()
+                    else:
+                        pmf_b = pmf_b - pmf_b.mean()
+                    pmf_bootstrap.append(pmf_b)
                 except Exception:
                     continue
             
             if pmf_bootstrap:
-                pmf_bootstrap_full = np.array(pmf_bootstrap)
+                pmf_bootstrap_full = np.vstack(pmf_bootstrap)
                 pmf_std = np.std(pmf_bootstrap_full, axis=0)
                 pmf_lower = np.percentile(pmf_bootstrap_full, 2.5, axis=0)
                 pmf_upper = np.percentile(pmf_bootstrap_full, 97.5, axis=0)
@@ -625,14 +644,14 @@ class PMFAnalyzer:
         mbar_cfg = (self.config.get('mbar') or {})
         policy = str(mbar_cfg.get('fallback_policy', 'numeric_only')).lower()
         if policy == 'numeric_only':
-            do_fallback = bad_numeric
-            reason = 'numeric' if bad_numeric else None
+            do_fallback = bad_numeric or (mbar_converged is False)
+            reason = 'numeric' if bad_numeric else ('not_converged' if (mbar_converged is False) else None)
         elif policy == 'strict':
             max_range = float(mbar_cfg.get('pmf_range_kj', 200.0))
             min_allowed = float(mbar_cfg.get('pmf_min_kj', -100.0))
             bad_strict = ((pmf.max() - pmf.min()) > max_range) or (np.nanmin(pmf) < min_allowed)
-            do_fallback = bad_numeric or bad_strict
-            reason = 'numeric' if bad_numeric else ('range' if bad_strict else None)
+            do_fallback = bad_numeric or bad_strict or (mbar_converged is False)
+            reason = 'numeric' if bad_numeric else ('range' if bad_strict else ('not_converged' if (mbar_converged is False) else None))
         elif policy == 'never':
             do_fallback = False
         if do_fallback:
@@ -660,20 +679,26 @@ class PMFAnalyzer:
             nonlocal last_iters
             tolerance = 1e-6
             max_iter = 1000
-            f_i = np.ones(n_bins)
-            f_k = np.ones(len(N_k_local))
+            # Use probability per bin p_i and scale factors g_k for states
+            p_i = np.ones(n_bins)
+            g_k = np.ones(len(N_k_local))
+            # Bin widths Δz for normalization integrals
+            dz_vec = np.diff(z_edges)
+            if dz_vec.size != n_bins:
+                dz_vec = np.full(n_bins, float(np.median(np.diff(z_edges))))
             it = 0
             for it in range(max_iter):
-                f_i_old = f_i.copy()
-                denominator = (N_k_local[:, None] * f_k[:, None] * exp_neg_beta_V).sum(axis=0)
+                p_i_old = p_i.copy()
+                denom = (N_k_local[:, None] * g_k[:, None] * exp_neg_beta_V).sum(axis=0) + 1e-20
                 numerator = N_ki_local.sum(axis=0)
-                f_i = numerator / (denominator + 1e-20)
-                denom_k = (f_i[None, :] * exp_neg_beta_V).sum(axis=1)
-                f_k = 1.0 / (denom_k + 1e-20)
-                if np.abs(f_i - f_i_old).max() < tolerance:
+                p_i = numerator / denom
+                # Include Δz in the state-normalization integral
+                denom_k = (p_i[None, :] * exp_neg_beta_V * dz_vec[None, :]).sum(axis=1) + 1e-20
+                g_k = 1.0 / denom_k
+                if np.abs(p_i - p_i_old).max() < tolerance:
                     break
             last_iters = int(it + 1)
-            pmf_local = -np.log(f_i + 1e-20) / self.beta
+            pmf_local = -np.log(p_i + 1e-20) / self.beta
             # Normalize to bulk region
             bulk_mask = z_centers >= getattr(self, 'bulk_min', 2.4)
             if np.any(bulk_mask):
@@ -719,17 +744,22 @@ class PMFAnalyzer:
 
         # Optional adaptive grid refinement in steep regions
         if self.wham_adaptive_grid and self.wham_adaptive_passes > 0 and len(z_centers) > 5:
+            eps = float(((self.config.get('wham') or {}).get('convergence_kj', 0.2)))
+            min_counts = int(((self.config.get('wham') or {}).get('min_counts_refine', 20)))
             for _ in range(self.wham_adaptive_passes):
                 slope = np.abs(np.gradient(pmf, z_centers))
-                to_refine = np.where(slope > self.wham_adaptive_slope)[0]
-                if to_refine.size == 0:
+                # counts support on current grid
+                total_counts_cur = N_ki_main.sum(axis=0)
+                cand = np.where((slope > self.wham_adaptive_slope) & (total_counts_cur >= min_counts))[0]
+                if cand.size == 0:
                     break
                 inserts = []
-                for i in to_refine:
+                for i in cand:
                     if i < len(z_centers) - 1:
                         inserts.append(0.5 * (z_centers[i] + z_centers[i+1]))
                 if not inserts:
                     break
+                pmf_old = pmf.copy()
                 z_edges = np.sort(np.unique(np.concatenate([z_edges, inserts])))
                 z_centers = (z_edges[:-1] + z_edges[1:]) / 2
                 n_bins = len(z_centers)
@@ -749,13 +779,25 @@ class PMFAnalyzer:
                     V_ki_template[k, :] = 0.5 * self.k * (z_centers - centers[k])**2
                 exp_neg_beta_V = np.exp(-self.beta * V_ki_template)
                 pmf = wham_solve(N_ki_main, N_k_main)
+                if np.max(np.abs(pmf - pmf_old)) < eps:
+                    break
 
-        # Normalize by detected bulk plateau if enabled (use total_counts)
+        # Normalize by detected bulk plateau if enabled (use only supported bins)
         if getattr(self, 'auto_bulk', True):
             counts_support = total_counts[first:last+1]
+            support = counts_support >= self.bulk_min_count
             bulk_mask = self._bulk_mask(z_centers, pmf, counts_support)
+            bulk_mask = np.logical_and(bulk_mask, support)
             if np.any(bulk_mask):
                 pmf = pmf - pmf[bulk_mask].mean()
+            else:
+                if np.any(support):
+                    z_sup = z_centers[support]
+                    thresh = np.percentile(z_sup, 90.0)
+                    mask_top = np.logical_and(support, z_centers >= thresh)
+                    pmf = pmf - pmf[mask_top].mean()
+                else:
+                    pmf = pmf - np.median(pmf)
         # Optional symmetrization for reporting
         if self.symmetrize:
             pmf = self._symmetrize_profile(z_centers, pmf)
@@ -784,25 +826,29 @@ class PMFAnalyzer:
                 for k, d in enumerate(data):
                     d_use = d[::thin] if thin > 1 else d
                     if bs_method in ('block', 'blocks', 'blocked') and g_k is not None:
-                        # Non-overlapping block bootstrap with block length ~ g_k frames
-                        bl = int(max(2, round(g_k[k])))
+                        # Non-overlapping block bootstrap with block length ~ 2*g_k frames
+                        bl = int(max(2, round(2.0 * g_k[k])))
                         if bl >= len(d_use):
                             # fallback to simple resample
-                            idx = np.random.choice(len(d_use), len(d_use), replace=True)
+                            idx = self.rng.choice(len(d_use), len(d_use), replace=True)
                             boot_data.append(d_use[idx])
                         else:
                             # Build non-overlapping blocks
                             blocks = [d_use[i:i+bl] for i in range(0, len(d_use), bl)]
                             n_blocks = max(1, int(np.ceil(len(d_use) / bl)))
-                            sel = np.random.choice(len(blocks), n_blocks, replace=True)
+                            sel = self.rng.choice(len(blocks), n_blocks, replace=True)
                             boot_series = np.concatenate([blocks[i] for i in sel])
                             # Trim to original length
                             if boot_series.size > len(d_use):
                                 boot_series = boot_series[:len(d_use)]
                             boot_data.append(boot_series)
+                    elif bs_method in ('stationary', 'stationary_bootstrap', 'sb') and g_k is not None:
+                        L_mean = max(2, int(round(g_k[k])))
+                        boot_series = self._stationary_bootstrap(d_use, L_mean)
+                        boot_data.append(boot_series)
                     else:
                         # IID bootstrap
-                        idx = np.random.choice(len(d_use), len(d_use), replace=True)
+                        idx = self.rng.choice(len(d_use), len(d_use), replace=True)
                         boot_data.append(d_use[idx])
 
                 N_ki_boot = np.zeros((len(data), n_bins))
@@ -824,13 +870,27 @@ class PMFAnalyzer:
             pmf_std = np.zeros_like(pmf)
         return z_centers, pmf, pmf_std, pmf_lower, pmf_upper, pmf_bootstrap_full
     
-    def extract_features(self, z_grid, pmf, pmf_std=None):
-        """Extract key features from PMF profile"""
+    def extract_features(self, z_grid, pmf, pmf_std=None, counts=None):
+        """Extract key features from PMF profile.
+
+        If counts are provided, bulk determination is constrained to bins with
+        sufficient support to avoid using empty, clipped tails.
+        """
         features = {}
         
-        # Find bulk region using config or default
-        bulk_mask = self._bulk_mask(z_grid, pmf, None) if getattr(self, 'auto_bulk', True) else (z_grid >= getattr(self, 'bulk_min', 2.4))
-        pmf_bulk = pmf[bulk_mask].mean() if isinstance(bulk_mask, np.ndarray) and bulk_mask.any() else (pmf[-10:].mean() if len(pmf) >= 10 else pmf.mean())
+        # Find bulk region; constrain to supported bins if counts provided
+        if getattr(self, 'auto_bulk', True):
+            bulk_mask = self._bulk_mask(z_grid, pmf, counts)
+        else:
+            bulk_mask = (z_grid >= getattr(self, 'bulk_min', 2.4))
+        if counts is not None:
+            support = (np.asarray(counts) >= self.bulk_min_count)
+            bulk_mask = np.logical_and(bulk_mask, support)
+        if isinstance(bulk_mask, np.ndarray) and bulk_mask.any():
+            pmf_bulk = float(np.mean(pmf[bulk_mask]))
+        else:
+            # PMF is already normalized to bulk earlier; default to 0.0
+            pmf_bulk = 0.0
         
         # Adaptive feature ranges (use analysis.feature_params)
         feat_cfg = (self.config.get('feature_params') or {})
@@ -871,30 +931,145 @@ class PMFAnalyzer:
         
         # Add uncertainties if available
         if pmf_std is not None and len(pmf_std) == len(pmf):
-            if ads_mask.any():
-                features['delta_g_ads_std'] = float(pmf_std[ads_mask].mean())
-            if insert_mask.any():
-                features['delta_g_insert_std'] = float(pmf_std[insert_mask].mean())
+            if np.any(ads_region):
+                features['delta_g_ads_std'] = float(pmf_std[ads_region].mean())
+            if np.any(insert_region):
+                features['delta_g_insert_std'] = float(pmf_std[insert_region].mean())
 
         return features
 
-    def compute_adsorption_metrics(self, z_grid, pmf, pmf_std=None, pmf_lower=None, pmf_upper=None):
+    def compute_adsorption_metrics(self, z_grid, pmf, pmf_std=None, pmf_lower=None, pmf_upper=None, counts=None):
         """Compute adsorption partition integral Kp_ads and HC50 estimate.
 
         Uses config under analysis.adsorption with defaults:
-          - z_low: 0.5 nm, z_high: 1.6 nm
+          - window_mode: energy_band | pmf_negative | around_min | fixed
+          - energy_band_kj: 3.0 (only for window_mode=energy_band)
+          - z_low/z_high for fixed mode or fallback
           - area_per_lipid_nm2: 0.62
-          - lp_star_range: [30, 100]
+          - lp_star_range: [154, 515]
         """
         ads_cfg = (self.config or {}).get('adsorption', {})
+        mode = str(ads_cfg.get('window_mode', 'fixed')).lower()
         z_low = float(ads_cfg.get('z_low', 0.5))
         z_high = float(ads_cfg.get('z_high', 1.6))
         area_per_lipid = float(ads_cfg.get('area_per_lipid_nm2', 0.62))
-        lp_star = ads_cfg.get('lp_star_range', [30, 100])
+        lp_star = ads_cfg.get('lp_star_range', [154, 515])
         if isinstance(lp_star, (int, float)):
             lp_star = [float(lp_star), float(lp_star)]
         else:
-            lp_star = [float(lp_star[0]), float(lp_star[1])] if lp_star else [30.0, 100.0]
+            lp_star = [float(lp_star[0]), float(lp_star[1])] if lp_star else [154.0, 515.0]
+
+        # Support mask (counts-based), membrane bounds and bulk side
+        if counts is not None:
+            support_min = int(ads_cfg.get('support_min_count', self.bulk_min_count))
+            support = (np.asarray(counts) >= support_min)
+        else:
+            support = np.ones_like(z_grid, dtype=bool)
+        mem = (ads_cfg.get('membrane') or {})
+        z_lo_mem = float(mem.get('z_lo', -1.5))
+        z_hi_mem = float(mem.get('z_hi', 1.5))
+        margin = float(mem.get('margin_nm', 0.2))
+        bulk_side_mask = (z_grid >= z_hi_mem + margin)
+
+        # Determine window automatically if requested
+        if mode == 'pmf_negative':
+            raw = (pmf < 0.0) & bulk_side_mask & support
+            if np.any(raw):
+                m = raw.astype(np.int8)
+                diff = np.diff(np.concatenate(([0], m, [0])))
+                starts = np.where(diff == 1)[0]
+                ends = np.where(diff == -1)[0] - 1
+                if len(starts):
+                    lengths = ends - starts + 1
+                    i = int(np.argmax(lengths))
+                    z_low = float(z_grid[starts[i]])
+                    z_high = float(z_grid[ends[i]])
+                else:
+                    # no contiguous block
+                    z_low = z_high = float(z_grid[0])
+            else:
+                z_low = z_high = float(z_grid[0])
+        elif mode == 'around_min':
+            # Choose adsorption minimum on the water side within feature range (0 .. ads_max_z)
+            feat_cfg = (self.config.get('feature_params') or {})
+            ads_upper = float(feat_cfg.get('ads_max_z', min(getattr(self, 'bulk_min', 2.4), 2.0)))
+            cand = (z_grid >= 0.0) & (z_grid <= ads_upper)
+            if counts is not None:
+                cand = np.logical_and(cand, support)
+            if np.any(cand):
+                masked = np.where(cand, pmf, np.inf)
+                i_min = int(np.argmin(masked))
+            else:
+                i_min = int(np.argmin(pmf))
+            z0 = float(z_grid[i_min])
+            width = float(ads_cfg.get('auto_width_nm', 0.6))
+            zl = z0 - 0.5 * width
+            zh = z0 + 0.5 * width
+            # clamp to data extents
+            z_low = float(max(z_grid.min(), zl))
+            z_high = float(min(z_grid.max(), zh))
+            # tighten to supported bins if available
+            if counts is not None:
+                mask_tmp = (z_grid >= z_low) & (z_grid <= z_high) & support
+                idx = np.where(mask_tmp)[0]
+                if idx.size:
+                    z_low = float(z_grid[idx[0]])
+                    z_high = float(z_grid[idx[-1]])
+                else:
+                    z_low = z_high = float(z_grid[0])
+        elif mode in ('energy_band', 'energyband', 'band'):
+            # Robust: define adsorption band by energy threshold around the minimum
+            # 1) Find adsorption minimum within 0..ads_max_z on water side
+            feat_cfg = (self.config.get('feature_params') or {})
+            ads_upper = float(feat_cfg.get('ads_max_z', min(getattr(self, 'bulk_min', 2.4), 2.0)))
+            region = (z_grid >= 0.0) & (z_grid <= ads_upper)
+            if counts is not None:
+                region = np.logical_and(region, support)
+            if np.any(region):
+                masked = np.where(region, pmf, np.inf)
+                i_min = int(np.argmin(masked))
+            else:
+                i_min = int(np.argmin(pmf))
+            w_min = float(pmf[i_min])
+            band_kj = float(ads_cfg.get('energy_band_kj', 3.0))
+            band_mask = (pmf <= (w_min + band_kj))
+            # Restrict band to water side feature region
+            band_mask = np.logical_and(band_mask, (z_grid >= 0.0) & (z_grid <= ads_upper))
+            if counts is not None:
+                band_mask = np.logical_and(band_mask, support)
+            if np.any(band_mask):
+                # Find contiguous segment around the minimum index
+                m = band_mask.astype(np.int8)
+                diff = np.diff(np.concatenate(([0], m, [0])))
+                starts = np.where(diff == 1)[0]
+                ends = np.where(diff == -1)[0] - 1
+                # Select the block that contains i_min (or nearest)
+                sel = None
+                for s, e in zip(starts, ends):
+                    if s <= i_min <= e:
+                        sel = (s, e)
+                        break
+                if sel is None:
+                    # Fallback: choose block whose center is closest to i_min
+                    centers_idx = [(s + e) // 2 for s, e in zip(starts, ends)]
+                    k = int(np.argmin([abs(c - i_min) for c in centers_idx])) if centers_idx else None
+                    if k is not None:
+                        sel = (int(starts[k]), int(ends[k]))
+                if sel is not None:
+                    z_low = float(z_grid[sel[0]])
+                    z_high = float(z_grid[sel[1]])
+                else:
+                    # Last resort: small symmetric window around minimum
+                    width = float(ads_cfg.get('auto_width_nm', 0.6))
+                    z0 = float(z_grid[i_min])
+                    z_low = float(max(z_grid.min(), z0 - 0.5 * width))
+                    z_high = float(min(z_grid.max(), z0 + 0.5 * width))
+            else:
+                # No band after restrictions; fallback to narrow window around min
+                width = float(ads_cfg.get('auto_width_nm', 0.6))
+                z0 = float(z_grid[i_min])
+                z_low = float(max(z_grid.min(), z0 - 0.5 * width))
+                z_high = float(min(z_grid.max(), z0 + 0.5 * width))
 
         # Optional smoothing for integration stability
         smooth_cfg = (self.config or {}).get('smoothing', {})
@@ -908,60 +1083,92 @@ class PMFAnalyzer:
 
         # Select adsorption region mask
         mask = (z_grid >= z_low) & (z_grid <= z_high)
+        # Constrain to support if provided
+        if counts is not None:
+            mask = np.logical_and(mask, support)
         if not np.any(mask):
+            # No supported region: Kp=0 by construction
             return {
                 'z_low': z_low, 'z_high': z_high,
                 'area_per_lipid_nm2': area_per_lipid,
                 'lp_star_range': lp_star,
-                'kp_ads_nm': None,
+                'bilayer_factor': float(ads_cfg.get('bilayer_factor', 2.0)),
+                'kp_ads_nm': 0.0,
+                'kp_ads_nm_ci': [0.0, 0.0],
                 'hc50_molar_range': None,
                 'hc50_uM_range': None,
+                'hc50_uM_ci': None,
                 'dg_ads_eff': None
             }
-        # Kp_ads integral (length in nm)
-        # Kp = ∫ exp(−beta * PMF(z)) dz over adsorption region
-        integrand = np.exp(-self.beta * pmf_use[mask])
-        kp_ads = float(integrate.trapezoid(integrand, z_grid[mask]))
+        # Kp_ads integral (length in nm) with numerical stabilization
+        # Kp = ∫(e^{x} − 1) dz, where x = −β W(z)
+        x = -self.beta * pmf_use[mask]
+        x0 = float(np.max(x))
+        # ∫ e^{x} dz = e^{x0} ∫ e^{x−x0} dz; ∫ 1 dz computed on masked grid
+        kp_scaled = float(integrate.trapezoid(np.exp(x - x0), z_grid[mask]))
+        dz_len = float(integrate.trapezoid(np.ones_like(x), z_grid[mask]))
+        kp_ads = float(kp_scaled * np.exp(x0) - dz_len)
+        kp_ads = float(max(kp_ads, 0.0))
         kp_ci = None
         # Optional CI from pmf_lower/pmf_upper percentiles if provided
         if pmf_lower is not None and pmf_upper is not None:
             if len(pmf_lower) == len(pmf) == len(z_grid):
-                # Upper PMF -> lower Kp; Lower PMF -> upper Kp
-                integ_low = np.exp(-self.beta * pmf_upper[mask])
-                integ_high = np.exp(-self.beta * pmf_lower[mask])
-                kp_low = float(integrate.trapezoid(integ_low, z_grid[mask]))
-                kp_high = float(integrate.trapezoid(integ_high, z_grid[mask]))
+                # Upper PMF -> lower Kp; Lower PMF -> upper Kp (use same stabilization)
+                x_low = -self.beta * pmf_upper[mask]
+                x0_low = float(np.max(x_low))
+                kp_scaled_low = float(integrate.trapezoid(np.exp(x_low - x0_low), z_grid[mask]))
+                kp_low = float(kp_scaled_low * np.exp(x0_low) - dz_len)
+                x_high = -self.beta * pmf_lower[mask]
+                x0_high = float(np.max(x_high))
+                kp_scaled_high = float(integrate.trapezoid(np.exp(x_high - x0_high), z_grid[mask]))
+                kp_high = float(kp_scaled_high * np.exp(x0_high) - dz_len)
+                kp_low = float(max(kp_low, 0.0)); kp_high = float(max(kp_high, 0.0))
                 kp_ci = [kp_low, kp_high]
 
         # Critical surface coverage Gamma* from L/P* and area per lipid
         # HC50 = Gamma* / (0.602214 * Kp_ads)
         conv = 0.602214  # 1 M = 0.602214 nm^-3
+        bilayer_factor = float(ads_cfg.get('bilayer_factor', 2.0))
+        kp_eff = kp_ads * bilayer_factor if np.isfinite(kp_ads) else kp_ads
         gamma_min = 1.0 / (area_per_lipid * lp_star[1])
         gamma_max = 1.0 / (area_per_lipid * lp_star[0])
-        hc50_min = float(gamma_min / (conv * kp_ads))  # mol/L
-        hc50_max = float(gamma_max / (conv * kp_ads))
+        # Guard against invalid Kp
+        if (kp_eff is None) or (not np.isfinite(kp_eff)) or (kp_eff <= 0.0):
+            return {
+                'z_low': z_low, 'z_high': z_high,
+                'area_per_lipid_nm2': area_per_lipid,
+                'lp_star_range': [lp_star[0], lp_star[1]],
+                'bilayer_factor': bilayer_factor,
+                'kp_ads_nm': kp_ads,
+                'kp_ads_nm_ci': kp_ci,
+                'hc50_molar_range': None,
+                'hc50_uM_range': None,
+                'hc50_uM_ci': None,
+                'dg_ads_eff': None
+            }
+        hc50_min = float(gamma_min / (conv * kp_eff))  # mol/L
+        hc50_max = float(gamma_max / (conv * kp_eff))
         hc50_ci = None
         if kp_ci is not None:
             kp_low, kp_high = kp_ci
-            # Convert to HC50 CI for both L/P* extremes; report range across both
-            hc_min_low = float(gamma_min / (conv * kp_high))
-            hc_min_high = float(gamma_min / (conv * kp_low))
-            hc_max_low = float(gamma_max / (conv * kp_high))
-            hc_max_high = float(gamma_max / (conv * kp_low))
-            # Collapse to overall low/high in µM for readability
+            hc_min_low = float(gamma_min / (conv * (kp_high * bilayer_factor)))
+            hc_min_high = float(gamma_min / (conv * (kp_low * bilayer_factor)))
+            hc_max_low = float(gamma_max / (conv * (kp_high * bilayer_factor)))
+            hc_max_high = float(gamma_max / (conv * (kp_low * bilayer_factor)))
             hc50_ci = {
                 'lp_star_min_uM': [hc_min_low * 1e6, hc_min_high * 1e6],
                 'lp_star_max_uM': [hc_max_low * 1e6, hc_max_high * 1e6]
             }
         # Effective ΔG_ads from Kp with Δz_eff as region width
         dz_eff = max(1e-6, (z_high - z_low))
-        dg_ads_eff = float(- (1.0 / self.beta) * np.log(max(1e-300, kp_ads / dz_eff)))
+        dg_ads_eff = float(- (1.0 / self.beta) * np.log(max(1e-300, kp_eff / dz_eff)))
 
         return {
             'z_low': z_low, 'z_high': z_high,
             'area_per_lipid_nm2': area_per_lipid,
             'lp_star_range': [lp_star[0], lp_star[1]],
-            'kp_ads_nm': kp_ads,
+            'bilayer_factor': bilayer_factor,
+            'kp_ads_nm': kp_eff,
             'kp_ads_nm_ci': kp_ci,
             'hc50_molar_range': [hc50_min, hc50_max],
             'hc50_uM_range': [hc50_min * 1e6, hc50_max * 1e6],
@@ -1003,6 +1210,10 @@ class PMFAnalyzer:
                 else:
                     zmin = min(data[i].min(), data[j].min())
                     zmax = max(data[i].max(), data[j].max())
+                    # Guard against degenerate ranges and NaNs
+                    if not np.isfinite(zmin) or not np.isfinite(zmax) or zmax <= zmin:
+                        overlap_matrix[i, j] = 0.0
+                        continue
                     bins = np.linspace(zmin, zmax, 50)
                     h1,_ = np.histogram(data[i], bins=bins, density=True)
                     h2,_ = np.histogram(data[j], bins=bins, density=True)
@@ -1100,6 +1311,28 @@ class PMFAnalyzer:
         }
         return out, summary
 
+    def _stationary_bootstrap(self, x: np.ndarray, L_mean: int) -> np.ndarray:
+        """Stationary bootstrap (Politis-Romano) for correlated 1D series.
+
+        - L_mean: expected block length (>=2). Uses geometric draws with p=1/L_mean.
+        - Wraps indices circularly to preserve local correlation.
+        """
+        x = np.asarray(x, dtype=float)
+        n = x.size
+        if n == 0:
+            return x.copy()
+        L = max(2, int(L_mean))
+        p = 1.0 / L
+        out = np.empty(n, dtype=float)
+        i = int(self.rng.integers(0, n))
+        for t in range(n):
+            out[t] = x[i]
+            if self.rng.random() < p:
+                i = int(self.rng.integers(0, n))
+            else:
+                i = (i + 1) % n
+        return out
+
     def propose_densification(self, overlap_matrix, centers):
         """Suggest additional window centers to bridge low-overlap neighbors.
 
@@ -1107,8 +1340,11 @@ class PMFAnalyzer:
         below the configured minimum (default 0.10), propose the midpoint.
         Returns dict with pairs_below_threshold and suggested_centers.
         """
-        cfg = _load_global_pmf_config()
-        qc = ((cfg.get('pmf') or {}).get('qc') or {})
+        # Prefer local analysis config; fallback to global defaults
+        qc = (self.config.get('qc') or {})
+        if not qc:
+            cfg = _load_global_pmf_config()
+            qc = ((cfg.get('pmf') or {}).get('qc') or {})
         min_ol = float(qc.get('min_neighbor_overlap', 0.10))
         centers = np.asarray(centers, dtype=float)
         order = np.argsort(centers)
@@ -1142,21 +1378,23 @@ class PMFAnalyzer:
         """
         fig, ax = plt.subplots(figsize=(10, 6))
         
-        # Plot PMF
-        ax.plot(z, pmf, 'b-', linewidth=2, label='PMF')
+        # Plot PMF (hide unsupported bins if ci_mask provided)
+        pmf_line = pmf.copy()
+        if ci_mask is not None and isinstance(ci_mask, np.ndarray) and ci_mask.shape == pmf.shape:
+            pmf_line = pmf_line.copy()
+            pmf_line[~ci_mask] = np.nan
+        ax.plot(z, pmf_line, 'b-', linewidth=2, label='PMF')
         # CI drawing with optional mask to avoid edge artifacts
         if pmf_lower is not None and pmf_upper is not None and len(pmf_lower) == len(pmf):
             if ci_mask is None or (isinstance(ci_mask, np.ndarray) and ci_mask.dtype==bool and ci_mask.shape==pmf.shape):
                 # draw in contiguous segments where mask True
                 mask = ci_mask if ci_mask is not None else np.ones_like(pmf, dtype=bool)
-                # find contiguous True segments
-                starts = np.where(np.logical_and(mask, np.logical_not(np.roll(mask, 1))))[0]
-                ends = np.where(np.logical_and(mask, np.logical_not(np.roll(mask, -1))))[0]
-                if mask[0]:
-                    starts = np.insert(starts, 0, 0) if (len(starts)==0 or starts[0]!=0) else starts
-                if mask[-1]:
-                    ends = np.append(ends, len(mask)-1) if (len(ends)==0 or ends[-1]!=len(mask)-1) else ends
-                for s,e in zip(starts, ends):
+                # robust segment detection via diff on padded mask
+                m = mask.astype(np.int8)
+                diff = np.diff(np.concatenate(([0], m, [0])))
+                starts = np.where(diff == 1)[0]
+                ends = np.where(diff == -1)[0] - 1
+                for s, e in zip(starts, ends):
                     ax.fill_between(z[s:e+1], pmf_lower[s:e+1], pmf_upper[s:e+1], color='b', alpha=0.2)
                 ax.plot([], [], color='b', alpha=0.2, label='95% CI')
             else:
@@ -1208,21 +1446,23 @@ class PMFAnalyzer:
         fig = plt.figure(figsize=(10, 8))
         gs = gridspec.GridSpec(2, 1, height_ratios=[2.5, 1.5])
         ax_top = fig.add_subplot(gs[0])
-        # Top panel: PMF (replot explicitly)
-        ax_top.plot(z, pmf, 'b-', linewidth=2)
+        # Top panel: PMF (mask unsupported bins if ci_mask provided)
+        pmf_line = pmf.copy()
+        if ci_mask is not None and isinstance(ci_mask, np.ndarray) and ci_mask.shape == pmf.shape:
+            pmf_line = pmf_line.copy()
+            pmf_line[~ci_mask] = np.nan
+        ax_top.plot(z, pmf_line, 'b-', linewidth=2)
         if pmf_lower is not None and pmf_upper is not None:
             # draw masked CI
             if ci_mask is None:
                 ax_top.fill_between(z, pmf_lower, pmf_upper, color='b', alpha=0.2)
             else:
                 mask = ci_mask
-                starts = np.where(np.logical_and(mask, np.logical_not(np.roll(mask, 1))))[0]
-                ends = np.where(np.logical_and(mask, np.logical_not(np.roll(mask, -1))))[0]
-                if mask[0]:
-                    starts = np.insert(starts, 0, 0) if (len(starts)==0 or starts[0]!=0) else starts
-                if mask[-1]:
-                    ends = np.append(ends, len(mask)-1) if (len(ends)==0 or ends[-1]!=len(mask)-1) else ends
-                for s,e in zip(starts, ends):
+                m = mask.astype(np.int8)
+                diff = np.diff(np.concatenate(([0], m, [0])))
+                starts = np.where(diff == 1)[0]
+                ends = np.where(diff == -1)[0] - 1
+                for s, e in zip(starts, ends):
                     ax_top.fill_between(z[s:e+1], pmf_lower[s:e+1], pmf_upper[s:e+1], color='b', alpha=0.2)
         # Features
         if features.get('z_ads') is not None:
@@ -1256,10 +1496,10 @@ class PMFAnalyzer:
         # Bottom panel: per-window histograms
         ax_bottom = fig.add_subplot(gs[1], sharex=ax_top)
         z_centers = (z_edges[:-1] + z_edges[1:]) / 2.0
-        # Normalize each histogram to unit area for comparability
-        for h, c in zip(hist_per_window, centers):
-            area = np.trapz(h, z_centers) if h.sum() > 0 else 1.0
-            y = h / max(area, 1e-12)
+        # Normalize each histogram by total counts (per-bin probabilities)
+        for h, _c in zip(hist_per_window, centers):
+            total = float(np.sum(h))
+            y = (h / total) if total > 0 else h
             ax_bottom.plot(z_centers, y, color='tab:gray', alpha=0.35, linewidth=1)
         ax_bottom.set_xlabel('z-coordinate (nm)')
         ax_bottom.set_ylabel('Density (a.u.)')
@@ -1335,9 +1575,19 @@ class PMFAnalyzer:
         else:
             z_grid, pmf, pmf_std, pmf_lower, pmf_upper, pmf_bootstrap_full = self.calculate_wham(data, centers, do_bootstrap, n_bootstrap)
         
-        # Extract features
+        # Extract features (bulk using supported bins only)
         print("\nExtracting PMF features...")
-        features = self.extract_features(z_grid, pmf, pmf_std)
+        # Build counts on the same z grid for support-aware bulk detection
+        try:
+            dz_feat = float(np.median(np.diff(z_grid))) if len(z_grid) > 1 else self.grid_spacing
+            z_edges_feat = np.concatenate(([z_grid[0] - dz_feat/2], (z_grid[:-1] + z_grid[1:]) / 2, [z_grid[-1] + dz_feat/2]))
+            counts_feat = np.zeros_like(z_grid, dtype=int)
+            for d in data:
+                ctmp, _ = np.histogram(d, bins=z_edges_feat)
+                counts_feat += ctmp
+        except Exception:
+            counts_feat = None
+        features = self.extract_features(z_grid, pmf, pmf_std, counts=counts_feat)
         
         # Convergence check removed (redundant and expensive)
         convergence_value = None
@@ -1357,6 +1607,7 @@ class PMFAnalyzer:
         if not self.config.get('no_plots', False):
             print("\nGenerating plots...")
             plots_dir.mkdir(exist_ok=True)
+            ci_mask = None  # ensure defined for fallback path
             try:
                 # Build coverage mask for plotting CIs only where supported
                 dz = float(np.median(np.diff(z_grid))) if len(z_grid) > 1 else self.grid_spacing
@@ -1369,6 +1620,19 @@ class PMFAnalyzer:
                     h_per_window.append(c.astype(float) / max(c.sum(), 1))
                 min_count = int(((self.config.get('plot') or {}).get('min_bin_count_for_ci') or 25))
                 ci_mask = counts >= min_count
+                # Optional: refine CI mask using bootstrap coverage/width if available
+                if pmf_bootstrap_full is not None and np.size(pmf_bootstrap_full) > 0:
+                    finite_frac = np.mean(np.isfinite(pmf_bootstrap_full), axis=0)
+                    ci_width = (np.nanpercentile(pmf_bootstrap_full, 97.5, axis=0) -
+                                np.nanpercentile(pmf_bootstrap_full,  2.5, axis=0))
+                    plot_cfg = (self.config.get('plot') or {})
+                    min_frac = float(plot_cfg.get('ci_min_bootstrap_fraction', 0.90))
+                    max_band = float(plot_cfg.get('ci_max_band_kj', 200.0))
+                    ci_mask_extra = (finite_frac >= min_frac) & np.isfinite(ci_width) & (ci_width <= max_band)
+                    if ci_mask is None:
+                        ci_mask = ci_mask_extra
+                    else:
+                        ci_mask = ci_mask & ci_mask_extra
                 # PMF plot with coverage + hist panel
                 self.plot_pmf_with_histograms(
                     z_grid, pmf, pmf_std, features,
@@ -1382,7 +1646,7 @@ class PMFAnalyzer:
                 self.plot_pmf(
                     z_grid, pmf, pmf_std, features,
                     plots_dir / "pmf_profile.png",
-                    pmf_lower=pmf_lower, pmf_upper=pmf_upper
+                    pmf_lower=pmf_lower, pmf_upper=pmf_upper, ci_mask=ci_mask
                 )
             # Overlap heatmap always attempted
             self.plot_overlap_heatmap(overlap_matrix, centers, plots_dir / "overlap_matrix.png")
@@ -1411,14 +1675,20 @@ class PMFAnalyzer:
 
         # Adsorption metrics and HC50 estimate
         # If we have bootstrap PMFs, prefer CI from Kp distribution over per-bin envelope
-        adsorption = self.compute_adsorption_metrics(z_grid, pmf, pmf_std, pmf_lower, pmf_upper)
+        adsorption = self.compute_adsorption_metrics(z_grid, pmf, pmf_std, pmf_lower, pmf_upper, counts=counts_feat)
         if pmf_bootstrap_full is not None:
             mask = (z_grid >= adsorption['z_low']) & (z_grid <= adsorption['z_high'])
             if np.any(mask):
-                # Compute Kp for each bootstrap replicate
-                integrands = np.exp(-self.beta * pmf_bootstrap_full[:, mask])
-                kp_samples = integrate.trapezoid(integrands, z_grid[mask], axis=1)
-                kp_samples = kp_samples[kp_samples > 0]
+                # Compute Kp for each bootstrap replicate with stabilization
+                x = -self.beta * pmf_bootstrap_full[:, mask]
+                x0 = np.max(x, axis=1, keepdims=True)
+                kp_scaled = integrate.trapezoid(np.exp(x - x0), z_grid[mask], axis=1)
+                dz_len = float(integrate.trapezoid(np.ones_like(z_grid[mask]), z_grid[mask]))
+                kp_samples = kp_scaled * np.exp(x0.flatten()) - dz_len
+                # Apply bilayer factor if configured
+                bilayer_factor = float(((self.config or {}).get('adsorption') or {}).get('bilayer_factor', 2.0))
+                kp_samples = kp_samples * bilayer_factor
+                kp_samples = kp_samples[np.isfinite(kp_samples) & (kp_samples > 0)]
                 if kp_samples.size:
                     kp_lo, kp_hi = float(np.percentile(kp_samples, 2.5)), float(np.percentile(kp_samples, 97.5))
                     adsorption['kp_ads_nm_ci'] = [kp_lo, kp_hi]
@@ -1552,7 +1822,11 @@ class PMFAnalyzer:
         if do_bootstrap:
             print(f"Bootstrap samples: {n_bootstrap}")
         print(f"\nKey Features:")
-        print(f"  ΔG_ads: {features.get('delta_g_ads', 'N/A'):.2f} kJ/mol")
+        dg_ads_val = features.get('delta_g_ads')
+        if dg_ads_val is None:
+            print("  ΔG_ads: N/A")
+        else:
+            print(f"  ΔG_ads: {dg_ads_val:.2f} kJ/mol")
         if features.get('delta_g_insert') is not None:
             print(f"  ΔG_insert: {features['delta_g_insert']:.2f} kJ/mol")
         if features.get('delta_g_barrier') is not None:
@@ -1684,14 +1958,15 @@ def main():
         description="Analyze PMF from umbrella sampling with MBAR/WHAM"
     )
     parser.add_argument("pmf_dir", help="PMF directory (replicate/tag dir or pmf root)")
-    parser.add_argument("--method", default="mbar", choices=["mbar", "wham"], help="Analysis method")
+    # Default to WHAM for robust, dependency-light analysis
+    parser.add_argument("--method", default="wham", choices=["mbar", "wham"], help="Analysis method")
     parser.add_argument("--bootstrap", type=int, default=0, help="Number of bootstrap samples (0 = no bootstrap)")
     parser.add_argument("--no-bootstrap", action="store_true", help="Disable bootstrap uncertainty estimation")
     parser.add_argument("--bootstrap-thin", type=int, default=1, help="Thinning factor applied only to bootstrap resamples (speed-up)")
     parser.add_argument("--no-plots", action="store_true", help="Skip plot generation")
     parser.add_argument("--aggregate", action="store_true", help="If multiple replicates found under pmf_dir, aggregate features")
     parser.add_argument("--no-aggregate", action="store_true", help="Force single-replicate mode even if multiples found")
-    parser.add_argument("--bootstrap-method", type=str, default=None, choices=["standard","block"], help="Bootstrap resampling: standard (IID) or block (moving blocks via ESS)")
+    parser.add_argument("--bootstrap-method", type=str, default=None, choices=["standard","block","stationary"], help="Bootstrap resampling: standard (IID), block (NBB via ESS) or stationary (Politis-Romano)")
     parser.add_argument("--strict-qc", action="store_true", help="Exit non-zero if JS/ergodicity thresholds or strict consistency violations are present")
     # Time filtering (analysis): discard early frames, restrict, thin by time
     parser.add_argument("--begin-ps", type=float, default=None, help="Discard data before this time (ps) in each window")
@@ -1700,7 +1975,7 @@ def main():
     parser.add_argument("--discard-fraction", type=float, default=None, help="Discard this fraction from start of each window if --begin-ps not set (0<frac<1)")
     # MBAR tuning knobs
     parser.add_argument("--mbar-max-samples", type=int, default=None, help="Cap total samples for MBAR by global thinning (e.g., 200000)")
-    parser.add_argument("--mbar-solver", type=str, default=None, help="MBAR solver protocol: robust | default | adaptive")
+    # Removed: --mbar-solver (no effect in current MBAR init)
     parser.add_argument("--mbar-max-iter", type=int, default=None, help="MBAR maximum iterations (e.g., 5000)")
     parser.add_argument("--mbar-rel-tol", type=float, default=None, help="MBAR relative tolerance (e.g., 1e-7)")
     args = parser.parse_args()
@@ -1761,13 +2036,18 @@ def main():
             analyzer.config['time_filter'] = tf
         if args.discard_fraction is not None:
             analyzer.config['discard_fraction'] = float(args.discard_fraction)
+        # Sync CLI time filters into analyzer attributes to ensure they take effect
+        tf_eff = analyzer.config.get('time_filter', {}) or {}
+        analyzer.begin_ps = tf_eff.get('begin_ps', analyzer.begin_ps)
+        analyzer.end_ps   = tf_eff.get('end_ps',   analyzer.end_ps)
+        analyzer.dt_ps    = tf_eff.get('dt_ps',    analyzer.dt_ps)
+        if 'discard_fraction' in analyzer.config:
+            analyzer.discard_fraction = analyzer.config['discard_fraction']
         # Apply MBAR tuning from CLI if provided
-        if args.mbar_max_samples or args.mbar_solver or args.mbar_max_iter or args.mbar_rel_tol:
+        if args.mbar_max_samples or args.mbar_max_iter or args.mbar_rel_tol:
             analyzer.config['mbar'] = analyzer.config.get('mbar', {})
             if args.mbar_max_samples:
                 analyzer.config['mbar']['max_samples'] = int(args.mbar_max_samples)
-            if args.mbar_solver:
-                analyzer.config['mbar']['solver_protocol'] = str(args.mbar_solver)
             if args.mbar_max_iter:
                 analyzer.config['mbar']['max_iterations'] = int(args.mbar_max_iter)
             if args.mbar_rel_tol:

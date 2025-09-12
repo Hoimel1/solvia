@@ -30,26 +30,32 @@ def _kyte_doolittle_scores():
 
 def predict_tm_segments(seq: str, window: int = 19, threshold: float = 1.6):
     """Predict TM helices using Kyte-Doolittle sliding window.
-    Returns list of (start, end) indices for putative segments.
+    Returns list of (start, end) indices (0-based, inclusive) for putative segments.
+    Optimized and with corrected segment ends.
     """
     seq = (seq or '').upper()
-    if not seq:
+    if not seq or len(seq) < window:
         return []
     kd = _kyte_doolittle_scores()
-    n = len(seq)
-    vals = [kd.get(ch, 0.0) for ch in seq]
+    import numpy as _np
+    vals = _np.array([kd.get(ch, 0.0) for ch in seq], dtype=float)
+    n = len(vals)
+    cs = _np.cumsum(_np.r_[0.0, vals])
+    ma = (cs[window:] - cs[:-window]) / float(window)  # length n-window+1
     segs = []
-    for i in range(0, max(0, n - window + 1)):
-        mean = sum(vals[i:i+window]) / window
-        if mean >= threshold:
-            # extend contiguous windows
+    i = 0
+    last = n - window
+    while i <= last:
+        if ma[i] >= threshold:
             start = i
             j = i + 1
-            while j <= n - window and (sum(vals[j:j+window]) / window) >= threshold:
+            while j <= last and ma[j] >= threshold:
                 j += 1
-            segs.append((start, j + window - 1))
+            end = j + window - 2  # inclusive end index
+            segs.append((start, min(end, n - 1)))
             i = j
-    # Merge overlapping/adjacent
+        else:
+            i += 1
     merged = []
     for s, e in segs:
         if not merged or s > merged[-1][1] + 1:
@@ -78,22 +84,37 @@ def predict_tm_segments_tools(fasta_path: str):
     Fallback to empty list if tools unavailable or parsing fails.
     """
     def _parse_segments_from_text(txt: str):
+        import re
         segs = []
-        lines = [l.strip() for l in txt.splitlines() if l.strip()]
-        for l in lines:
-            u = l.upper()
-            # Accept common markers
-            if ('TRANSMEM' in u) or ('TMHELIX' in u) or ('TOPOLOGY' in u):
-                import re
-                # Look for ranges like 12-34
-                for a, b in re.findall(r'(\d+)\s*-\s*(\d+)', u):
+        for line in (txt or '').splitlines():
+            u = line.strip()
+            if not u:
+                continue
+            U = u.upper()
+            # 1) TMHMM Topology lines: only 'M' (membrane) segments
+            m = re.search(r'TOPOLOGY\s*=\s*(.*)', U)
+            if m:
+                topo = m.group(1)
+                # Find label-range triples like M12-34, I1-10, O11-20 (case-insensitive)
+                for lab, a, b in re.findall(r'([IOM])\s*(\d+)\s*(?:[-.]{1,2}|\s+)\s*(\d+)', topo, flags=re.IGNORECASE):
+                    if lab.upper() != 'M':
+                        continue
                     try:
                         s = max(0, int(a) - 1)
                         e = max(s, int(b) - 1)
                         segs.append((s, e))
                     except Exception:
-                        continue
-        # Merge overlapping
+                        pass
+                continue
+            # 2) Phobius/TMHMM long output: only explicit TM lines
+            for a, b in re.findall(r'(?:TRANSMEM|TMHELIX)\s+(\d+)\s*(?:[-.]{1,2}|\s+)\s*(\d+)', U):
+                try:
+                    s = max(0, int(a) - 1)
+                    e = max(s, int(b) - 1)
+                    segs.append((s, e))
+                except Exception:
+                    pass
+        # Merge overlapping/adjacent
         segs.sort()
         merged = []
         for s, e in segs:
@@ -103,10 +124,12 @@ def predict_tm_segments_tools(fasta_path: str):
                 merged[-1][1] = max(merged[-1][1], e)
         return [(int(a), int(b)) for a, b in merged]
 
-    # Try TMHMM
+    # Try TMHMM (portable: pipe FASTA on stdin with --short)
     try:
         if _tool_available('tmhmm'):
-            res = subprocess.run(['tmhmm', fasta_path], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False)
+            with open(fasta_path, 'r') as fh:
+                fa = fh.read()
+            res = subprocess.run(['tmhmm', '--short'], input=fa, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False)
             segs = _parse_segments_from_text(res.stdout or '')
             if segs:
                 return segs
@@ -118,6 +141,13 @@ def predict_tm_segments_tools(fasta_path: str):
             if _tool_available(exe):
                 # Use -long if supported to include TRANSMEM lines
                 res = subprocess.run([exe, '-long', fasta_path], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False)
+                segs = _parse_segments_from_text(res.stdout or '')
+                if segs:
+                    return segs
+                # Fallback: pipe FASTA via stdin
+                with open(fasta_path, 'r') as fh:
+                    fa = fh.read()
+                res = subprocess.run([exe, '-long'], input=fa, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False)
                 segs = _parse_segments_from_text(res.stdout or '')
                 if segs:
                     return segs
@@ -155,37 +185,49 @@ def optimize_colabfold_params(base_cfg: dict, fasta_path: str):
     return cfg
 
 def parse_pdb_plddt(pdb_file):
+    """Extract per-residue pLDDT from CA B-factors and CA coordinates."""
     vals = []
     ca_coords = []
-    with open(pdb_file, 'r') as f:
-        for line in f:
-            if line.startswith('ATOM'):
+    try:
+        with open(pdb_file, 'r') as f:
+            for line in f:
+                if not line.startswith('ATOM'):
+                    continue
+                if line[12:16].strip() != 'CA':
+                    continue
                 try:
                     b = float(line[60:66])
                     vals.append(b)
                 except Exception:
                     pass
-                if line[12:16].strip() == 'CA':
+                try:
                     x = float(line[30:38]); y = float(line[38:46]); z = float(line[46:54])
                     ca_coords.append([x, y, z])
-    return np.array(vals) if vals else None, (np.array(ca_coords) if ca_coords else None)
+                except Exception:
+                    pass
+    except Exception:
+        return None, None
+    return (np.array(vals) if vals else None), (np.array(ca_coords) if ca_coords else None)
 
 def kabsch_rmsd(P, Q):
-    # assume shapes (N,3)
+    """Compute RMSD after optimal superposition (Kabsch)."""
     if P is None or Q is None:
         return None
+    P = np.asarray(P, dtype=float)
+    Q = np.asarray(Q, dtype=float)
     if P.shape != Q.shape or P.shape[0] < 3:
         return None
     Pc = P - P.mean(axis=0)
     Qc = Q - Q.mean(axis=0)
     C = Pc.T @ Qc
-    V, S, Wt = np.linalg.svd(C)
-    d = np.sign(np.linalg.det(V @ Wt))
-    D = np.diag([1,1,d])
-    U = V @ D @ Wt
-    R = Pc @ U
-    diff = R - Qc
-    return float(np.sqrt((diff*diff).sum() / P.shape[0]))
+    U, S, Vt = np.linalg.svd(C)  # C = U @ S @ Vt
+    R = Vt.T @ U.T
+    if np.linalg.det(R) < 0.0:
+        Vt[-1, :] *= -1.0
+        R = Vt.T @ U.T
+    Prot = Pc @ R
+    diff = Prot - Qc
+    return float(np.sqrt((diff * diff).sum() / P.shape[0]))
 
 def clash_score(pdb_file, softness=0.4):
     """Atom-typed clash score using vdW radii; returns clashes per atom.
@@ -280,9 +322,13 @@ def ramachandran_quality(pdb_file):
         # General (non-Gly/Pro)
         gen_fav = ((-160 <= phi <= -40 and -80 <= psi <= 50) or (-180 <= phi <= -70 and 90 <= psi <= 180))
         gen_all = gen_fav or ((-180 <= phi <= -20 and -150 <= psi <= 90) or (-180 <= phi <= -20 and 60 <= psi <= 180))
-        # Glycine (wider)
+        # Glycine (wider) — allowed but not entire plane
         gly_fav = ((-180 <= phi <= -20 and -100 <= psi <= 100) or (-100 <= phi <= 100 and 90 <= psi <= 180))
-        gly_all = gly_fav or (-180 <= phi <= 180 and -180 <= psi <= 180)
+        gly_all = (
+            (-180 <= phi <=  -20 and -180 <= psi <= 160) or
+            ( -100 <= phi <=  100 and  -80 <= psi <=  80) or
+            (  100 <= phi <=  180 and   90 <= psi <= 180)
+        )
         # Proline (restricted phi)
         pro_fav = (-90 <= phi <= -30 and -80 <= psi <= 50)
         pro_all = pro_fav or (-120 <= phi <= -10 and -120 <= psi <= 90)
@@ -310,7 +356,7 @@ def ramachandran_quality(pdb_file):
     return {'favored': frac_favored, 'allowed': frac_allowed, 'n_eval': total, 'secondary_structure': ss}
 
 def disulfide_analysis(pdb_file):
-    # detect SG-SG within 1.9–2.2 Å; bad if <1.9 or >2.5 with both Cys near
+    # detect SG-SG within 1.9–2.2 Å; bad if <1.9 or >2.2 (pairs listed up to 2.5 Å)
     bb = _parse_backbone_coords(pdb_file)
     cys_res = [rid for rid, rec in bb.items() if rec.get('res','').upper().startswith('CYS') and 'SG' in rec]
     pairs = []
@@ -320,7 +366,7 @@ def disulfide_analysis(pdb_file):
             a = bb[cys_res[i]]['SG']; b = bb[cys_res[j]]['SG']
             d = float(np.linalg.norm(a-b))
             if d <= 2.5:
-                pairs.append({'res1': int(cys_res[i]), 'res2': int(cys_res[j]), 'distance_A': d*10.0/10.0})
+                pairs.append({'res1': int(cys_res[i]), 'res2': int(cys_res[j]), 'distance_A': float(d)})
                 if d < 1.9 or d > 2.2:
                     bad += 1
     return {'count': len(pairs), 'bad_count': bad, 'pairs': pairs}
@@ -395,16 +441,10 @@ def load_run_metadata(run_dir):
         return yaml.safe_load(f)
 
 def check_colabfold_available():
-    """Check if colabfold_batch is available in PATH"""
+    """Check if colabfold_batch is available in PATH (portable)."""
     try:
-        result = subprocess.run(
-            ["which", "colabfold_batch"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
-        )
-        return result.returncode == 0
-    except:
+        return shutil.which("colabfold_batch") is not None
+    except Exception:
         return False
 
 def run_colabfold(run_dir):
@@ -474,7 +514,7 @@ def run_colabfold(run_dir):
     
     print(f"Running ColabFold for {metadata['peptide_id']}...")
     print(f"Command: {' '.join(cmd)}")
-    print(f"This may take 10-30 minutes depending on sequence length...")
+    print(f"This may take a while depending on sequence length and settings...")
     
     # Run ColabFold
     with open(log_file, 'w') as log:
@@ -537,11 +577,12 @@ def select_best_model(output_dir, config):
     
     # Find all score files
     score_files = glob.glob(os.path.join(output_dir, "*_scores_rank_*.json"))
+    # Also consider ranking_debug.json produced by (Colab)Fold
+    ranking_debug = os.path.join(output_dir, "ranking_debug.json")
     
     # Gather per-model metrics
     models = []
-    # Map rank -> score data
-    score_map = {}
+    # Map rank -> score data (unused map removed)
     if not score_files:
         print("Warning: No score files found, extracting pLDDT from B-factors...")
         for pdb_file in all_pdb_files:
@@ -578,7 +619,28 @@ def select_best_model(output_dir, config):
                     if f"rank_{rank_num:03d}" in pdb_file or f"rank_{rank_num:01d}" in pdb_file:
                         pdb_match = pdb_file; break
                 plddt_vec_pdb, ca = parse_pdb_plddt(pdb_match) if pdb_match else (None, None)
-                models.append({'pdb': pdb_match, 'rank': rank_num, 'plddt_vec': (plddt_vec or plddt_vec_pdb), 'plddt_mean': plddt_mean, 'ptm': ptm, 'ca': ca})
+                # Prefer JSON pLDDT vector when available; else fall back to parsed PDB B-factors
+                plddt_vec_final = plddt_vec if plddt_vec is not None else plddt_vec_pdb
+                models.append({'pdb': pdb_match, 'rank': rank_num, 'plddt_vec': plddt_vec_final, 'plddt_mean': plddt_mean, 'ptm': ptm, 'ca': ca})
+
+        # Optional: augment missing means from ranking_debug.json
+        try:
+            if os.path.exists(ranking_debug):
+                with open(ranking_debug, 'r') as f:
+                    rd = json.load(f)
+                pl_map = rd.get('plddts') or rd.get('plddt') or {}
+                for i, m in enumerate(models):
+                    if (not m.get('plddt_mean')) and m.get('pdb'):
+                        base = os.path.basename(m['pdb'])
+                        for k, v in pl_map.items():
+                            if str(k) in base:
+                                try:
+                                    models[i]['plddt_mean'] = float(v)
+                                except Exception:
+                                    pass
+                                break
+        except Exception:
+            pass
 
     # Compute ensemble RMSD matrix
     n_models = len(models)
@@ -610,7 +672,7 @@ def select_best_model(output_dir, config):
         if n_models >= 2:
             vals = [v for v in rmsd_matrix[i] if v is not None]
             mean_r = float(np.mean(vals)) if vals else None
-            agree = (1.0 / (1.0 + mean_r)) if mean_r is not None else 0.5
+            agree = (max(0.0, 1.0 - min(mean_r, 5.0)/5.0) if mean_r is not None else 0.5)
         else:
             agree = 0.5
         # validation-derived metrics
@@ -777,7 +839,12 @@ def select_best_model(output_dir, config):
         best_link = os.path.join(output_dir, "best_model.pdb")
         if os.path.exists(best_link):
             os.remove(best_link)
-        os.symlink(os.path.basename(best_pdb), best_link)
+        try:
+            os.symlink(os.path.basename(best_pdb), best_link)
+        except Exception:
+            # Fallback: copy if symlink unsupported
+            import shutil as _sh
+            _sh.copy2(best_pdb, best_link)
     
     print(f"\n✓ Model selection complete")
     print(f"  Best model: {os.path.basename(best_pdb) if best_pdb else 'None'}")

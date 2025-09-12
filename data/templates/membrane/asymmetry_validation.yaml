@@ -1,0 +1,20 @@
+metrics:
+  CHOL_asymmetry_index: 0.42170542635658914
+  CHOL_lower_fraction: 0.42170542635658914
+  CHOL_upper_fraction: 0.0
+  POPC_asymmetry_index: 0.3249181279277038
+  POPC_lower_fraction: 0.1937984496124031
+  POPC_upper_fraction: 0.5187165775401069
+  POPE_asymmetry_index: 0.14573643410852713
+  POPE_lower_fraction: 0.14573643410852713
+  POPE_upper_fraction: 0.0
+  POPS_asymmetry_index: 0.08783318824358496
+  POPS_lower_fraction: 0.10387596899224806
+  POPS_upper_fraction: 0.016042780748663103
+  PSM_asymmetry_index: 0.33035692078099743
+  PSM_lower_fraction: 0.13488372093023257
+  PSM_upper_fraction: 0.46524064171123
+  chol_mean_fraction: 0.21085271317829457
+  chol_total_fraction: 0.42170542635658914
+  ps_inner_enrichment_ratio: 6.474935400516795
+passed: true

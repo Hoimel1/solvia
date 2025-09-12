@@ -25,13 +25,14 @@ import logging
 
 KB_KJ_MOL_K = 0.008314462618  # kJ/mol/K
 
-# Prefer SciPy's PPF; fallback to Acklam approximation
-try:
-    from scipy.stats import norm as _scipy_norm  # type: ignore
-    _ppf = _scipy_norm.ppf
-except Exception:
-    def _ppf(p: float) -> float:
-        """Acklam approximation to inverse normal CDF for p in (0,1)."""
+# --- math/helpers for QC and spacing ---
+def _dz_max_for_overlap(T_K: float, k_kj_mol_nm2: float, overlap: float) -> float:
+    """Given target histogram overlap O and harmonic k, return max allowed Δz."""
+    sigma = math.sqrt(KB_KJ_MOL_K * T_K / k_kj_mol_nm2)
+    # 1D Gaussian: choose z so that two Gaussians separated by Δz have min-overlap ~O
+    # This is approximated by Δz_max ≈ 2 * sigma * z_alpha with alpha = 1 - O/2
+    # using inverse normal CDF; numeric approx here via scipy-free Acklam like in old script
+    def _norm_ppf(p: float) -> float:
         if not (0.0 < p < 1.0):
             raise ValueError("p in (0,1)")
         a = [-3.969683028665376e+01, 2.209460984245205e+02, -2.759285104469687e+02,
@@ -43,25 +44,18 @@ except Exception:
         d = [7.784695709041462e-03, 3.224671290700398e-01, 2.445134137142996e+00,
              3.754408661907416e+00]
         plow = 0.02425; phigh = 1 - plow
-        import math as _m
         if p < plow:
-            q = _m.sqrt(-2.0 * _m.log(p))
+            q = math.sqrt(-2.0 * math.log(p))
             return (((((c[0]*q + c[1])*q + c[2])*q + c[3])*q + c[4])*q + c[5]) / \
                    ((((d[0]*q + d[1])*q + d[2])*q + d[3])*q + 1.0)
         if p > phigh:
-            q = _m.sqrt(-2.0 * _m.log(1.0 - p))
+            q = math.sqrt(-2.0 * math.log(1.0 - p))
             return -(((((c[0]*q + c[1])*q + c[2])*q + c[3])*q + c[4])*q + c[5]) / \
                      ((((d[0]*q + d[1])*q + d[2])*q + d[3])*q + 1.0)
         q = p - 0.5; r = q*q
         return (((((a[0]*r + a[1])*r + a[2])*r + a[3])*r + a[4])*r + a[5]) * q / \
                (((((b[0]*r + b[1])*r + b[2])*r + b[3])*r + b[4])*r + 1.0)
-
-# --- math/helpers for QC and spacing ---
-def _dz_max_for_overlap(T_K: float, k_kj_mol_nm2: float, overlap: float) -> float:
-    """Given target histogram overlap O and harmonic k, return max allowed Δz."""
-    sigma = math.sqrt(KB_KJ_MOL_K * T_K / k_kj_mol_nm2)
-    # 1D Gaussian: Δz_max ≈ 2 * sigma * z_alpha with alpha = 1 - O/2
-    z = _ppf(1.0 - overlap / 2.0)
+    z = _norm_ppf(1.0 - overlap / 2.0)
     return 2.0 * sigma * z
 
 def _round3(x: float) -> float:
@@ -71,24 +65,6 @@ def _dedup_sorted_centers(centers):
     """Round to 3 decimals, drop duplicates, return sorted(desc)."""
     s = sorted({_round3(c) for c in centers}, reverse=True)
     return s
-
-def _js_divergence_from_series(z1: np.ndarray, z2: np.ndarray, bins: int = 100) -> float:
-    """Compute Jensen-Shannon divergence between two 1D series via histograms."""
-    z1 = np.asarray(z1, dtype=float)
-    z2 = np.asarray(z2, dtype=float)
-    if z1.size == 0 or z2.size == 0:
-        return float('nan')
-    zmin = float(min(np.min(z1), np.min(z2)))
-    zmax = float(max(np.max(z1), np.max(z2)))
-    if not np.isfinite(zmin) or not np.isfinite(zmax) or zmax <= zmin:
-        return float('nan')
-    hist1, edges = np.histogram(z1, bins=bins, range=(zmin, zmax), density=True)
-    hist2, _     = np.histogram(z2, bins=edges, density=True)
-    p = np.clip(hist1, 1e-12, None); p = p / p.sum()
-    q = np.clip(hist2, 1e-12, None); q = q / q.sum()
-    m = 0.5 * (p + q)
-    kl = lambda a, b: float((a * np.log(a / b)).sum())
-    return 0.5 * kl(p, m) + 0.5 * kl(q, m)
 
 def _integrated_autocorr_time(x: np.ndarray, max_lag: int = None) -> float:
     """Compute simple integrated autocorrelation time tau_int."""
@@ -147,21 +123,6 @@ def _robust_ess(x: np.ndarray, W: int | None = None) -> float:
     ess = float(n / (2.0 * tau_int))
     return max(1.0, ess)
 
-def _ess_pymbar(x: np.ndarray) -> float:
-    """Prefer pymbar statistical inefficiency if available; fallback to robust ESS."""
-    try:
-        from pymbar.timeseries import statistical_inefficiency  # type: ignore
-        x = np.asarray(x, dtype=float)
-        if x.size < 2:
-            return float(max(1, x.size))
-        g = float(statistical_inefficiency(x))
-        n = len(x)
-        if not np.isfinite(g) or g <= 0:
-            return _robust_ess(x)
-        return max(1.0, n / max(1.0, g))
-    except Exception:
-        return _robust_ess(x)
-
 class PMFRunner:
     """Enhanced PMF runner with local patch reference and QC gates"""
     
@@ -179,8 +140,8 @@ class PMFRunner:
         self.max_extend_ns = float(self.qc_config.get('max_extend_ns', 100.0))
         # QC: discard initial transient fraction when computing ESS/half-time
         self.qc_discard_frac = float(self.qc_config.get('discard_fraction', 0.1))
-        # QC: optional stride for ESS to mitigate oversampling bias (supports int or "auto")
-        self.qc_ess_stride = self.qc_config.get('ess_stride', 1)
+        # QC: optional stride for ESS to mitigate oversampling bias
+        self.qc_ess_stride = int(self.qc_config.get('ess_stride', 1))
         # Ensure same reference group across all windows to avoid analysis bias
         self.consistent_reference = bool(self.umbrella_config.get('consistent_reference', True))
         self.common_index_file = None
@@ -188,31 +149,6 @@ class PMFRunner:
         self.logger = logging.getLogger("pmf")
         self.logger.setLevel(logging.INFO)
         # Handlers are attached lazily in run_pmf_calculation when pmf_dir is known
-        # Round history for QC provenance
-        self.round_history = []
-
-    # --- Region helpers (bulk/approach/interface) ---
-    def _region_for_center(self, z: float) -> str:
-        if z >= 2.0:
-            return "bulk"
-        if z >= 0.6:
-            return "approach"
-        return "interface"
-
-    def _region_cfg(self, z: float) -> dict:
-        """Return region-specific QC thresholds with YAML overrides (deep-merge)."""
-        defaults = {
-            "bulk":      {"min_ess_frames":150, "min_neighbor_overlap":0.12, "half_energy_tol_kj":3.0, "half_z_tol_sigma":2.5, "min_time_ns":20.0},
-            "approach":  {"min_ess_frames":200, "min_neighbor_overlap":0.15, "half_energy_tol_kj":2.0, "half_z_tol_sigma":2.0, "min_time_ns":30.0},
-            "interface": {"min_ess_frames":300, "min_neighbor_overlap":0.20, "half_energy_tol_kj":1.0, "half_z_tol_sigma":1.5, "min_time_ns":40.0},
-        }
-        rt = (self.qc_config.get("region_thresholds") or {})
-        import copy
-        cfg = copy.deepcopy(defaults)
-        for k, v in rt.items():
-            if k in cfg and isinstance(v, dict):
-                cfg[k].update(v)
-        return cfg[self._region_for_center(float(z))]
 
     def _setup_logging(self, pmf_dir: Path):
         """Attach file + console handlers once we know the output directory."""
@@ -514,7 +450,7 @@ class PMFRunner:
             print(f"Warning: only {len(patch)} phosphates in patch (R={R:.1f} nm)")
         return patch
     
-    def create_dynamic_index_file(self, gro_path, output_ndx, window_center=None, ref_mode_override=None):
+    def create_dynamic_index_file(self, gro_path, output_ndx, window_center=None):
         """Create index file with (by default) a local patch reference.
 
         For PMF, we prefer to create this once from a single reference structure
@@ -529,7 +465,7 @@ class PMFRunner:
             raise ValueError("No peptide found in structure")
 
         # Get reference mode
-        ref_mode = ref_mode_override or self.umbrella_config.get('ref_mode', 'patch')
+        ref_mode = self.umbrella_config.get('ref_mode', 'patch')
 
         if ref_mode == 'midplane_local':
             patch_radius = self.umbrella_config.get('patch_radius', 2.5)
@@ -681,35 +617,29 @@ class PMFRunner:
     def robust_pbc_distance(self, pos1: np.ndarray, pos2: np.ndarray, box: np.ndarray | None, pbc_type: str = 'orthorhombic') -> float:
         """Robust PBC distance between two positions.
 
-        - Orthorhombic: minimal image using lengths (Lx,Ly,Lz)
-        - Triclinic: provide full 3x3 box matrix H; uses fractional wrapping
-        - Else: try MDAnalysis; if unavailable, raise ValueError (no Euclidean fallback)
+        For orthorhombic boxes: minimal image per component. For other types,
+        try MDAnalysis if available; else fallback to Euclidean.
         """
-        if box is None:
-            raise ValueError("PBC distance requested without box.")
-        p = np.asarray(pos1, dtype=float).reshape(3)
-        q = np.asarray(pos2, dtype=float).reshape(3)
-        B = np.asarray(box, dtype=float)
-        if pbc_type == 'orthorhombic' and B.ndim == 1 and B.size >= 3:
-            d = q - p
-            Lx, Ly, Lz = float(B[0]), float(B[1]), float(B[2])
-            if Lx > 0: d[0] -= round(d[0] / Lx) * Lx
-            if Ly > 0: d[1] -= round(d[1] / Ly) * Ly
-            if Lz > 0: d[2] -= round(d[2] / Lz) * Lz
-            return float(np.linalg.norm(d))
-        if B.shape == (3, 3):
-            H = B
-            Hinv = np.linalg.inv(H)
-            dfrac = Hinv.dot((q - p).reshape(3))
-            dfrac -= np.round(dfrac)
-            dcart = H.dot(dfrac)
-            return float(np.linalg.norm(dcart))
-        # Try MDAnalysis as a last resort for unusual PBC configs
         try:
-            from MDAnalysis.lib.distances import distance_array  # type: ignore
-            return float(distance_array(p.reshape(1, 3), q.reshape(1, 3), box=B)[0, 0])
+            p = np.asarray(pos1, dtype=float); q = np.asarray(pos2, dtype=float)
+            d = q - p
+            if pbc_type == 'orthorhombic' and box is not None and len(box) >= 3:
+                Lx, Ly, Lz = float(box[0]), float(box[1]), float(box[2])
+                if Lx > 0: d[0] -= round(d[0]/Lx) * Lx
+                if Ly > 0: d[1] -= round(d[1]/Ly) * Ly
+                if Lz > 0: d[2] -= round(d[2]/Lz) * Lz
+                return float(np.linalg.norm(d))
+            # Try MDAnalysis
+            try:
+                import MDAnalysis as mda
+                from MDAnalysis.lib.distances import distance_array
+                aa = pos1.reshape(1, -1); bb = pos2.reshape(1, -1)
+                dist = float(distance_array(aa, bb, box=box)[0,0])
+                return dist
+            except Exception:
+                return float(np.linalg.norm(d))
         except Exception:
-            raise ValueError("Unsupported PBC configuration; provide orthorhombic lengths or 3x3 box matrix.")
+            return float(np.linalg.norm(np.asarray(pos2) - np.asarray(pos1)))
 
     def _current_z_from_gro(self, gro_path: Path, ndx_path: Path, ref_group_name: str):
         """Compute z = COM(Peptide) - COM(RefGroup) with robust PBC handling along z."""
@@ -963,7 +893,7 @@ pull-coord1-start       = yes
                 x_max = max(z1.max(), z2.max()) + 2*np.std(z2)
                 xs = np.linspace(x_min, x_max, 1024)
                 p1 = kde1(xs); p2 = kde2(xs)
-                overlap = float(np.trapz(np.minimum(p1, p2), x=xs))
+                overlap = float(np.trapezoid(np.minimum(p1, p2), x=xs))
                 return max(0.0, min(1.0, overlap))
             except Exception:
                 pass  # fall back to histogram
@@ -989,7 +919,10 @@ pull-coord1-start       = yes
 
     def compute_window_qc(self, pullx_path: str, k_kj_mol_nm2: float, center_nm: float,
                            half_energy_tol_kj: float = 2.0):
-        """QC with telemetry: ESS, ESS-rate, half-energy, Half-Z, drift, tau_int, sigmas."""
+        """Umfassendere QC: ESS (robust), Halbenergie, Drift.
+
+        Verwirft initiale Transienten (qc.discard_fraction) vor der Auswertung.
+        """
         try:
             data = np.loadtxt(pullx_path, comments=['#','@'])
         except Exception:
@@ -998,116 +931,71 @@ pull-coord1-start       = yes
         if data.size == 0:
             return {"ess": None, "ess_pass": False, "half_energy_diff_kj": None, "half_pass": False,
                     "drift_nm_per_ns": None, "drift_pass": False}
-
-        t = data[:, 0]  # ps
-        z = data[:, 1]
-
-        # Discard initial transient
+        t = data[:,0]  # ps
+        z = data[:,1]
+        # Discard initial transient for QC
         if self.qc_discard_frac > 0 and len(z) > 10:
             start_idx = int(len(z) * self.qc_discard_frac)
-            start_idx = min(max(start_idx, 0), len(z) - 2)
+            start_idx = min(max(start_idx, 0), len(z)-2)
             z = z[start_idx:]
             t = t[start_idx:]
-
-        # dt and segment time
-        dt_ps = float(np.median(np.diff(t))) if len(t) >= 2 else 1.0
-        time_ns = float((t[-1] - t[0]) * 0.001) if len(t) >= 2 else (len(t) * dt_ps * 0.001)
-
-        # Optional: ESS stride (supports "auto")
-        stride_cfg = self.qc_config.get('ess_stride', 1)
-        if isinstance(stride_cfg, str) and str(stride_cfg).lower() == "auto":
-            tau_est = _integrated_autocorr_time(z)
-            target_dt_ps = max(4.0, 0.2 * tau_est * dt_ps)
-            s = max(1, int(round(target_dt_ps / dt_ps)))
-            z = z[::s]; t = t[::s]
-            dt_ps *= s
+        # sampling interval (ps)
+        if len(t) >= 2:
+            dt_ps = float(np.median(np.diff(t)))
         else:
-            try:
-                s = int(stride_cfg)
-            except Exception:
-                s = 1
-            if s > 1:
-                z = z[::s]; t = t[::s]
-                dt_ps *= s
-
-        # ESS and tau_int
-        tau_int = _integrated_autocorr_time(z)
-        ess = int(_ess_pymbar(z))
-        ess_rate = (ess / time_ns) if time_ns > 0 else 0.0
-
-        # Half-energy halves
-        mid = len(z) // 2
+            dt_ps = 1.0
+        # Optional stride for ESS to reduce autocorrelation bias from oversampling
+        if getattr(self, 'qc_ess_stride', 1) > 1:
+            stride = max(1, int(self.qc_ess_stride))
+            z = z[::stride]
+            t = t[::stride]
+        # ESS robust
+        ess = int(_robust_ess(z))
+        ess_pass = ess >= int(self.qc_config.get('min_ess_frames', 200))
+        # Half-time convergence proxy: harmonic bias energy difference between halves
+        mid = len(z)//2
         def mean_bias(zseg):
             dz = zseg - center_nm
-            return 0.5 * k_kj_mol_nm2 * float(np.mean(dz * dz))
-        e1 = mean_bias(z[:mid]); e2 = mean_bias(z[mid:])
+            # 1/2 k (dz)^2 in kJ/mol
+            return 0.5 * k_kj_mol_nm2 * float(np.mean(dz*dz))
+        e1 = mean_bias(z[:mid])
+        e2 = mean_bias(z[mid:])
         de = abs(e1 - e2)
-
-        # Half-Z test on means
-        import math as _m
-        m1 = float(np.mean(z[:mid])) if mid > 1 else float(np.mean(z))
-        m2 = float(np.mean(z[mid:])) if len(z) - mid > 1 else float(np.mean(z))
-        s1 = float(np.var(z[:mid], ddof=1)) if mid > 1 else 0.0
-        s2 = float(np.var(z[mid:], ddof=1)) if len(z) - mid > 1 else 0.0
-        n1 = max(1, mid); n2 = max(1, len(z) - mid)
-        se = _m.sqrt((s1 / n1) + (s2 / n2)) if (n1 > 1 and n2 > 1 and (s1 > 0 or s2 > 0)) else float('inf')
-        half_z_stat = abs((m1 - m2) / se) if _m.isfinite(se) and se > 0 else 0.0
-
-        # Drift
+        half_pass = de <= half_energy_tol_kj
+        # Drift-Analyse (nm/ns)
         try:
+            # Linear fit z(t)
             tt_ns = t * 0.001
             A = np.vstack([tt_ns, np.ones_like(tt_ns)]).T
             slope, intercept = np.linalg.lstsq(A, z, rcond=None)[0]
-            drift = float(abs(slope))
+            drift = float(abs(slope))  # nm/ns
         except Exception:
             drift = None
         drift_tol = float(self.qc_config.get('drift_tolerance_nm_per_ns', 0.1))
-
-        # Pass/Fail using global defaults (region-specific handled in run_qc_checks)
-        ess_pass = ess >= int(self.qc_config.get('min_ess_frames', 200))
-        half_pass_energy = de <= half_energy_tol_kj
-        half_pass_z = half_z_stat <= float(self.qc_config.get('half_z_tol_sigma', 2.0))
-        half_pass = (half_pass_energy and half_pass_z)
-
-        sigma_meas = float(np.std(z))
-        sigma_theory = float(_m.sqrt(max(1e-12, KB_KJ_MOL_K * float(self.temperature_K) / float(k_kj_mol_nm2))))
-
-        return {
-            "ess": ess, "ess_pass": ess_pass,
-            "half_energy_diff_kj": de, "half_pass": half_pass,
-            "drift_nm_per_ns": drift, "drift_pass": (drift is not None) and (drift <= drift_tol),
-            "time_ns": time_ns, "ess_rate": ess_rate,
-            "tau_int": float(tau_int),
-            "half_z_stat": float(half_z_stat),
-            "sigma_meas": sigma_meas, "sigma_theory": sigma_theory
-        }
+        drift_pass = (drift is not None) and (drift <= drift_tol)
+        return {"ess": ess, "ess_pass": ess_pass, "half_energy_diff_kj": de, "half_pass": half_pass,
+                "drift_nm_per_ns": drift, "drift_pass": drift_pass}
     
     def run_umbrella_window(self, window_center, window_dir, start_structure, 
-                          replicate=1, extend_time=0,
-                          prod_time_override: float | None = None,
-                          force_k_override: float | None = None,
-                          ref_mode_override: str | None = None,
-                          seed_tag: str | None = None,
-                          force_gen_vel: bool = False):
+                          replicate=1, extend_time=0):
         """Run single umbrella window with all improvements"""
         
         window_dir.mkdir(parents=True, exist_ok=True)
         
         # Prepare index for this window: reuse common index if configured
         index_file = window_dir / "index.ndx"
-        if (self.consistent_reference and self.common_index_file) and not ref_mode_override:
+        if self.consistent_reference and self.common_index_file:
             try:
                 shutil.copy(self.common_index_file, index_file)
                 ref_group = self.common_ref_group or 'LocalPatch'
             except Exception:
                 # Fallback to generating a window-specific index
-                index_file, ref_group = self.create_dynamic_index_file(start_structure, index_file, window_center, ref_mode_override=ref_mode_override)
+                index_file, ref_group = self.create_dynamic_index_file(start_structure, index_file, window_center)
         else:
             index_file, ref_group = self.create_dynamic_index_file(
                 start_structure,
                 index_file,
-                window_center,
-                ref_mode_override=ref_mode_override
+                window_center
             )
 
         # Determine pbcatom for reference group
@@ -1130,27 +1018,23 @@ pull-coord1-start       = yes
         
         # Generate deterministic seed
         peptide_id = self.run_dir.name.split('_')[0]
-        seed_suffix = f"_{seed_tag}" if seed_tag else ""
-        seed_string = f"{peptide_id}_rep{replicate}_z{window_center:.2f}{seed_suffix}"
+        seed_string = f"{peptide_id}_rep{replicate}_z{window_center:.2f}"
         seed = int(hashlib.md5(seed_string.encode()).hexdigest()[:8], 16) % 1000000
         
         # Production time
-        prod_time = (prod_time_override if prod_time_override is not None else self.umbrella_config.get('production_ns', 60.0)) + extend_time
-        force_k = float(force_k_override if force_k_override is not None else self.umbrella_config.get('force_constant', 900))
+        prod_time = self.umbrella_config.get('production_ns', 60.0) + extend_time
+        force_k = float(self.umbrella_config.get('force_constant', 900))
         # Optional adaptive force constant targeting desired sigma_z
         adapt_k_cfg = (self.umbrella_config.get('adaptive_k') or {})
-        # Apply adaptation only if no explicit override is provided
-        if bool(adapt_k_cfg.get('enabled', False)) and (force_k_override is None):
+        if bool(adapt_k_cfg.get('enabled', False)):
             sigma_target = float(adapt_k_cfg.get('sigma_target_nm', 0.06))
             k_min = float(adapt_k_cfg.get('k_min', 200.0))
             k_max = float(adapt_k_cfg.get('k_max', 5000.0))
             k_thermal = KB_KJ_MOL_K * float(self.temperature_K) / max(1e-6, sigma_target**2)
             k_opt = float(np.clip(k_thermal, k_min, k_max))
-            if abs(k_opt - force_k) / max(1e-12, force_k) > 0.1:
+            if abs(k_opt - force_k) / force_k > 0.1:
                 self.logger.info(f"  Adaptive k: {force_k:.1f} → {k_opt:.1f} kJ/mol/nm^2 (target σ≈{sigma_target} nm)")
             force_k = k_opt
-        elif bool(adapt_k_cfg.get('enabled', False)) and (force_k_override is not None):
-            self.logger.info(f"  Adaptive k: override {force_k_override:.1f} provided → skip adaptation")
         
         # Resolve structure for grompp
         structure_for_grompp = Path(start_structure)
@@ -1163,10 +1047,8 @@ pull-coord1-start       = yes
                 structure_for_grompp = prev_gro
 
         # Optionally prepare start via short SMD toward target center (reduces initial forces)
-        # Skip SMD if we are extending from an existing checkpoint
         smd_prepare = bool(self.umbrella_config.get('smd_prepare', True))
-        cpt_path = window_dir / "umbrella.cpt"
-        if smd_prepare and float(self.umbrella_config.get('pre_smd_ns', 1.0)) > 0 and not (extend_time > 0 and cpt_path.exists()):
+        if smd_prepare and float(self.umbrella_config.get('pre_smd_ns', 1.0)) > 0:
             smd_gro = self.run_smd_ladder(Path(start_structure), float(window_center), window_dir, index_file, ref_group, pbcatom1, seed)
             if smd_gro and Path(smd_gro).exists():
                 structure_for_grompp = Path(smd_gro)
@@ -1207,7 +1089,7 @@ pull-coord1-start       = yes
                 return False
 
         has_vel = _gro_has_velocities(structure_for_grompp)
-        gen_vel_flag = True if force_gen_vel else ((not has_vel) and (extend_time <= 0))
+        gen_vel_flag = (not has_vel) and (extend_time <= 0)
         continuation_flag = (not gen_vel_flag)
 
         mdp_content = f"""
@@ -1297,7 +1179,7 @@ define                 = -DPOSRES_LIPID_Z
         # Find topology
         top_file = self.find_topology_file()
         
-        # Prepare TPR for run (convert-tpr for extensions with checkpoint; else grompp)
+        # Run grompp via Docker
         tpr_file = window_dir / "umbrella.tpr"
         
         # Get relative paths from project root
@@ -1322,67 +1204,13 @@ define                 = -DPOSRES_LIPID_Z
             "-maxwarn", "2"
         ]
         
-        # If extending and checkpoint + original TPR exist, extend TPR via convert-tpr (avoid step mismatch)
-        tpr_ready = False
-        if extend_time > 0 and cpt_path.exists() and tpr_file.exists():
-            try:
-                rel_tpr = os.path.relpath(tpr_file, project_root)
-                tpr_ext = window_dir / "umbrella_ext.tpr"
-                rel_tpr_ext = os.path.relpath(tpr_ext, project_root)
-                extend_ps = int(round(float(extend_time) * 1000.0))
-                # Aim for absolute end time >= current last written time + extend_ps
-                # Prefer pullx.xvg as source of current time
-                pullx_path = window_dir / "pullx.xvg"
-                until_ps = None
-                if pullx_path.exists():
-                    try:
-                        last_t = None
-                        with open(pullx_path, 'r') as fh:
-                            for ln in fh:
-                                if ln.startswith('#') or ln.startswith('@'):
-                                    continue
-                                parts = ln.split()
-                                if len(parts) >= 2:
-                                    try:
-                                        last_t = float(parts[0])
-                                    except Exception:
-                                        pass
-                        if last_t is not None:
-                            until_ps = int(round(last_t + extend_ps))
-                    except Exception:
-                        until_ps = None
-                convert_cmd = [
-                    "docker", "compose", "run", "--rm", "--workdir", container_wd, "gromacs",
-                    "convert-tpr",
-                    "-s", f"/work/{rel_tpr}",
-                ]
-                if until_ps is not None and until_ps > 0:
-                    convert_cmd += ["-until", str(until_ps)]
-                else:
-                    convert_cmd += ["-extend", str(extend_ps)]
-                convert_cmd += ["-o", f"/work/{rel_tpr_ext}"]
-                print(f"  Extending TPR by +{extend_time:.1f} ns via convert-tpr…")
-                rconv = subprocess.run(convert_cmd, capture_output=True, text=True, cwd=str(project_root))
-                if rconv.returncode != 0:
-                    print(f"  ✗ convert-tpr failed; falling back to grompp: {rconv.stderr}")
-                else:
-                    try:
-                        # Replace original TPR with extended one
-                        os.replace(tpr_ext, tpr_file)
-                        tpr_ready = True
-                        print("  ✓ TPR extended")
-                    except Exception as e:
-                        print(f"  ✗ Failed to replace TPR after convert-tpr: {e}")
-            except Exception as e:
-                print(f"  ✗ convert-tpr error: {e}")
-        if not tpr_ready:
-            print(f"  Running grompp…")
-            sys.stdout.flush()
-            result = subprocess.run(grompp_cmd, capture_output=True, text=True, cwd=str(project_root))
-            if result.returncode != 0:
-                print(f"  ✗ Error in grompp: {result.stderr}")
-                return None
-            print(f"  ✓ TPR file created")
+        print(f"  Running grompp...")
+        sys.stdout.flush()
+        result = subprocess.run(grompp_cmd, capture_output=True, text=True, cwd=str(project_root))
+        if result.returncode != 0:
+            print(f"  ✗ Error in grompp: {result.stderr}")
+            return None
+        print(f"  ✓ TPR file created")
         
         # Run mdrun via Docker
         log_file = window_dir / "umbrella.log"
@@ -1407,6 +1235,7 @@ define                 = -DPOSRES_LIPID_Z
             "-g", f"/work/{rel_log}"
         ]
         # if extending, use checkpoint input and append
+        cpt_path = window_dir / "umbrella.cpt"
         rel_cpt = os.path.relpath(cpt_path, project_root)
         if extend_time > 0 and cpt_path.exists():
             mdrun_cmd += ["-cpi", f"/work/{rel_cpt}", "-append"]
@@ -1641,62 +1470,28 @@ pull-coord1-start       = yes
             pass
         return None
     def _extend_failed_windows(self, pmf_dir, windows_data, qc_results, start_structure, replicate):
-        """Adaptive extension for ESS/half-time deficits with region-aware thresholds.
-
-        Returns (windows_data, n_extended, extended_entries)
-        where extended_entries is a list of {center, add_ns}.
-        """
+        """Extend windows failing ESS or half-time convergence, up to max_extend_ns per window."""
         if not self.auto_extend:
-            return windows_data, 0, []
-
+            return windows_data
+        # Map centers to current total extra time by inspecting existing metadata in memory
         extended = 0
-        extended_entries = []
         new_windows = []
-
-        # Quick maps for current QC
-        ess_map = {float(it['center']): it for it in qc_results.get('ess_check', [])}
-        half_map = {float(it['center']): it for it in qc_results.get('convergence_check', [])}
-
         for w in windows_data:
             if not w:
                 new_windows.append(w)
                 continue
-            c = float(w['center'])
-            e = ess_map.get(c, {})
-            h = half_map.get(c, {})
-            reg = self._region_cfg(c)
-
-            need_ess = int(reg["min_ess_frames"])
-            cur_ess = int(e.get("ess", 0))
-            ess_rate = float(e.get("ess_rate") or 0.0)
-            time_ns = float(e.get("time_ns") or 0.0)
-            ess_fail = (cur_ess < need_ess)
-            half_fail = (not bool(h.get("passed", h.get("half_pass", False))))
-
+            center = w['center']
+            # Find QC for this center
+            ess_item = next((x for x in qc_results.get('ess_check', []) if x.get('center') == center), None)
+            half_item = next((x for x in qc_results.get('convergence_check', []) if x.get('center') == center), None)
+            ess_fail = (ess_item is None) or (not ess_item.get('passed', False))
+            half_fail = (half_item is None) or (not half_item.get('passed', False))
             if not (ess_fail or half_fail):
                 new_windows.append(w)
                 continue
-
-            # Compute required extra time
-            add_by_ess = 0.0
-            if ess_fail:
-                deficit = max(0, need_ess - cur_ess)
-                if ess_rate <= 1e-6:
-                    add_by_ess = self.extend_ns  # stagnating → minimal block
-                else:
-                    add_by_ess = max(5.0, float(np.ceil(deficit / ess_rate)))
-
-            add_by_half = 0.0
-            if half_fail and time_ns < float(reg.get("min_time_ns", 0.0)):
-                add_by_half = float(reg["min_time_ns"]) - time_ns
-
-            add = max(add_by_ess, add_by_half, 0.0)
-            if add <= 0.0:
-                new_windows.append(w)
-                continue
-
-            # Cap per window using marker file
-            window_dir = pmf_dir / "windows" / f"z_{c:+.3f}"
+            # Determine current extension by reading log nsteps? We simply add configured extend_ns but cap at max_extend_ns
+            # Store current cumulative extension in a small marker file
+            window_dir = pmf_dir / "windows" / f"z_{center:+.3f}"
             marker = window_dir / ".extended_ns"
             already = 0.0
             if marker.exists():
@@ -1705,162 +1500,25 @@ pull-coord1-start       = yes
                 except Exception:
                     already = 0.0
             if already >= self.max_extend_ns:
-                print(f"  ↷ Window z={c:+.3f} reached max extension ({already} ns), not extending further.")
+                print(f"  ↷ Window z={center:+.3f} reached max extension ({already} ns), not extending further.")
                 new_windows.append(w)
                 continue
-
-            add = float(min(add, self.max_extend_ns - already))
-            print(f"  ⤴ Extending window z={c:+.3f} by +{add:.1f} ns (ESS/half-time).")
-            res = self.run_umbrella_window(c, window_dir, start_structure, replicate, extend_time=add)
+            add = min(self.extend_ns, self.max_extend_ns - already)
+            print(f"  ⤴ Extending window z={center:+.3f} by +{add} ns (ESS/half-time fail; total so far {already+add} ns)")
+            res = self.run_umbrella_window(center, window_dir, start_structure, replicate, extend_time=add)
             if res:
+                # overwrite existing entry with updated paths (same files) and keep the center
                 new_windows.append(res)
                 extended += 1
-                extended_entries.append({"center": float(c), "add_ns": float(add)})
                 try:
-                    marker.write_text(f"{already + add}\n")
+                    marker.write_text(f"{already+add}\n")
                 except Exception:
                     pass
             else:
                 new_windows.append(w)
-
         if extended:
             print(f"Extended {extended} windows due to ESS/half-time QC failures.")
-        return new_windows, extended, extended_entries
-
-    def _replicate_low_ess_windows(self, pmf_dir: Path, windows_data, qc_results, start_structure, replicate):
-        """Fallback: replicate low-ESS or half-failing windows with new seeds.
-
-        Strategy (configurable in pmf.qc.fallback):
-          - Identify windows with ESS below trigger or half_pass/drift fail
-          - For each such center, run N short replicates (fresh gen-vel, new seed)
-          - Optionally increase k slightly to reduce relaxation time
-          - Optionally force a global PO4 reference to stabilize z
-          - For windows with half_fail, optionally restart from nearest passing neighbor .gro
-        Appends new window dicts and returns (windows_data, n_new, replicated_entries).
-        replicated_entries is a list of dicts with details for round history.
-        """
-        fb = (self.qc_config.get('fallback') or {})
-        if not bool(fb.get('enabled', True)):
-            return windows_data, 0, []
-        min_ess_trig = int(fb.get('min_ess_trigger', 50))
-        n_reps = int(fb.get('replicate_count', 3))
-        rep_ns = float(fb.get('per_replicate_ns', 50.0))
-        k_scale = float(fb.get('k_tune_scale', 1.2))
-        ref_override = str(fb.get('ref_mode', 'global')).lower()  # 'global' -> all PO4/P
-        restart_from_neighbor = bool(fb.get('restart_from_neighbor', True))
-
-        # Build maps for quick lookup
-        ess_map = {int(_round3(item['center'])*1000): int(item.get('ess', 0)) for item in qc_results.get('ess_check', [])}
-        half_map = {int(_round3(item['center'])*1000): bool(item.get('half_pass', False)) for item in qc_results.get('convergence_check', [])}
-
-        # Select target centers to replicate
-        targets = []
-        for w in sorted([w for w in windows_data if w], key=lambda x: x['center'], reverse=True):
-            key = int(_round3(w['center'])*1000)
-            ess = ess_map.get(key, 0)
-            half_ok = half_map.get(key, True)
-            if (ess < min_ess_trig) or (not half_ok):
-                targets.append(float(w['center']))
-        targets = _dedup_sorted_centers(targets)
-        if not targets:
-            return windows_data, 0
-
-        self.logger.warning(f"QC fallback: replicating {len(targets)} low-ESS/half-failing windows with {n_reps}×{rep_ns:.0f} ns")
-
-        # Helper: find neighbor gro for restart
-        def _neighbor_gro(center: float):
-            wins_sorted = sorted([w for w in windows_data if w], key=lambda x: x['center'], reverse=True)
-            # find nearest neighbor with half_pass True
-            cands = []
-            for w in wins_sorted:
-                k = int(_round3(w['center'])*1000)
-                if half_map.get(k, True):
-                    # prefer neighbors within 0.1–0.2 nm
-                    cands.append((abs(float(w['center']) - float(center)), w))
-            if not cands:
-                return None
-            cands.sort(key=lambda x: x[0])
-            best = cands[0][1]
-            gro = Path(best['pullx']).parent / 'umbrella.gro'
-            return gro if gro.exists() else None
-
-        base_k = float(self.umbrella_config.get('force_constant', 900))
-        k_rep = base_k * k_scale if k_scale and k_scale > 0 else base_k
-        # Map ref override to our create_dynamic_index modes
-        ref_mode_override = None
-        if ref_override in ('global', 'po4_all', 'upperpo4', 'po4'):
-            ref_mode_override = 'global'
-        elif ref_override in ('patch', 'local'):
-            ref_mode_override = 'patch'
-        elif ref_override in ('hybrid', 'midplane', 'midplane_local'):
-            ref_mode_override = 'hybrid'
-
-        new_entries = 0
-        replicated_entries = []
-        for c in targets:
-            win_dir_base = pmf_dir / 'windows' / f"z_{float(c):+0.3f}"
-            # Choose start structure
-            start_for_rep = None
-            if restart_from_neighbor:
-                try:
-                    start_for_rep = _neighbor_gro(float(c))
-                except Exception:
-                    start_for_rep = None
-            if start_for_rep is None or not Path(start_for_rep).exists():
-                # fallback to the window's own last structure if present, else global start_structure
-                maybe = win_dir_base / 'umbrella.gro'
-                start_for_rep = maybe if maybe.exists() else start_structure
-
-            for r in range(1, n_reps+1):
-                rep_dir = win_dir_base / f"rep_{r}"
-                seed_tag = f"fb{r}"
-                try:
-                    res = self.run_umbrella_window(
-                        c, rep_dir, start_for_rep, replicate=replicate,
-                        prod_time_override=rep_ns,
-                        force_k_override=k_rep,
-                        ref_mode_override=ref_mode_override,
-                        seed_tag=seed_tag,
-                        force_gen_vel=True,
-                    )
-                except Exception as e:
-                    self.logger.error(f"Fallback replicate failed for z={c:+.3f} rep {r}: {e}")
-                    res = None
-                if res:
-                    windows_data.append(res)
-                    new_entries += 1
-                    # Reason tagging for provenance
-                    reasons = []
-                    key = int(_round3(float(c))*1000)
-                    if ess_map.get(key, 10**9) < min_ess_trig:
-                        reasons.append("low_ess")
-                    if half_map.get(key, True) is False:
-                        reasons.append("half_fail")
-                    replicated_entries.append({
-                        "center": float(c),
-                        "rep": int(r),
-                        "ns": float(rep_ns),
-                        "k": float(k_rep),
-                        "ref_mode": (ref_override or "default"),
-                        "seed_tag": seed_tag,
-                        "reason": reasons or ["fallback"],
-                    })
-        if new_entries:
-            self.logger.info(f"QC fallback added {new_entries} replicate window runs.")
-        return windows_data, new_entries, replicated_entries
-
-    def _qc_gates_passed(self, qc_results):
-        """Return booleans for whether QC gates pass.
-
-        Currently enforces:
-        - Overlap gate: all adjacent pairs pass min_neighbor_overlap
-        - ESS gate: all windows meet min_ess_frames
-
-        Returns (overlap_ok, ess_ok).
-        """
-        ol = all(item.get('passed', False) for item in qc_results.get('overlap_check', [])) if qc_results.get('overlap_check') else True
-        ess = all(item.get('passed', False) for item in qc_results.get('ess_check', [])) if qc_results.get('ess_check') else True
-        return ol, ess
+        return new_windows
     
     def find_topology_file(self):
         """Find the appropriate topology file"""
@@ -1900,65 +1558,31 @@ pull-coord1-start       = yes
     
     def run_qc_checks(self, windows_data):
         qc_results = {"overlap_check": [], "convergence_check": [], "ess_check": []}
-        val_windows = sorted([w for w in windows_data if w], key=lambda x: x['center'], reverse=True)
-
-        # Overlap checks with region-strict thresholds and expected-vs-measured
-        k = float(self.umbrella_config.get('force_constant', 900))
+        # Overlap between neighbors (sorted by center so adjacency is correct)
+        val_windows = [w for w in windows_data if w]
+        val_windows = sorted(val_windows, key=lambda x: x['center'], reverse=True)
         for i in range(len(val_windows) - 1):
-            w1, w2 = val_windows[i], val_windows[i+1]
-            if float(w1['center']) == float(w2['center']):
-                continue
+            w1 = val_windows[i]
+            w2 = val_windows[i+1]
             overlap = self.check_window_overlap(w1['pullx'], w2['pullx'], self.target_overlap)
-            cfg1 = self._region_cfg(w1['center']); cfg2 = self._region_cfg(w2['center'])
-            min_ol = max(float(cfg1["min_neighbor_overlap"]), float(cfg2["min_neighbor_overlap"]))
-            dz = abs(float(w1['center']) - float(w2['center']))
-            expected = self._expected_overlap_gaussian(dz, k)
-            # JS divergence as additional diagnostic (histogram-based)
-            jsd = None
-            try:
-                d1 = np.loadtxt(w1['pullx'], comments=['#','@'])
-                d2 = np.loadtxt(w2['pullx'], comments=['#','@'])
-                if d1.size and d2.size:
-                    z1 = d1[:,1]; z2 = d2[:,1]
-                    jsd = float(_js_divergence_from_series(z1, z2, bins=100))
-            except Exception:
-                jsd = None
             qc_results["overlap_check"].append({
                 "windows": [w1['center'], w2['center']],
                 "overlap": overlap,
-                "expected": expected,
-                "delta": float(overlap - expected),
-                "min_required": min_ol,
-                "js_divergence": jsd,
-                "passed": overlap >= min_ol
+                "passed": overlap >= self.min_overlap
             })
-
-        # Per-window checks with region thresholds
+        # Per-window ESS & convergence
+        k = float(self.umbrella_config.get('force_constant', 900))
         for w in val_windows:
-            reg = self._region_cfg(w['center'])
-            qc = self.compute_window_qc(w['pullx'], k, w['center'], reg["half_energy_tol_kj"])
-            qc_results["ess_check"].append({
-                "center": w['center'],
-                "ess": qc['ess'],
-                "ess_rate": qc.get('ess_rate'),
-                "time_ns": qc.get('time_ns'),
-                "min_required": int(reg["min_ess_frames"]),
-                "passed": int(qc['ess'] or 0) >= int(reg["min_ess_frames"])
-            })
-            # Region-aware half-time decision
-            half_pass_reg = (float(qc['half_energy_diff_kj']) <= float(reg["half_energy_tol_kj"])) and \
-                            (float(qc.get('half_z_stat', 0.0)) <= float(reg["half_z_tol_sigma"]))
-            conv_item = {
+            qc = self.compute_window_qc(w['pullx'], k, w['center'], self.qc_config.get('half_energy_tol_kj', 2.0))
+            qc_results["ess_check"].append({"center": w['center'], "ess": qc['ess'], "passed": qc['ess_pass']})
+            qc_results["convergence_check"].append({
                 "center": w['center'],
                 "half_energy_diff_kj": qc['half_energy_diff_kj'],
-                "half_z_stat": qc.get('half_z_stat'),
-                "z_tol": float(reg["half_z_tol_sigma"]),
-                "half_pass": bool(half_pass_reg),
+                "half_pass": qc['half_pass'],
                 "drift_nm_per_ns": qc.get('drift_nm_per_ns'),
                 "drift_pass": qc.get('drift_pass', False),
-            }
-            conv_item["passed"] = bool(conv_item["half_pass"]) and bool(conv_item.get('drift_pass', True))
-            qc_results["convergence_check"].append(conv_item)
+                "passed": qc['half_pass'] and qc.get('drift_pass', True)
+            })
         return qc_results
 
     def write_run_manifest(self, pmf_dir: Path, window_centers, qc_results):
@@ -2058,13 +1682,6 @@ pull-coord1-start       = yes
     
     def generate_qc_report(self, qc_results, output_dir):
         report_file = output_dir / "qc_report.yaml"
-        # Attach round history if present
-        try:
-            if getattr(self, 'round_history', None):
-                qc_results = dict(qc_results)
-                qc_results["rounds"] = list(self.round_history)
-        except Exception:
-            pass
         with open(report_file, 'w') as f:
             yaml.dump(qc_results, f, default_flow_style=False)
         n_ol_pass = sum(1 for c in qc_results.get('overlap_check', []) if c.get('passed'))
@@ -2074,158 +1691,48 @@ pull-coord1-start       = yes
         n_half_pass = sum(1 for c in qc_results.get('convergence_check', []) if c.get('passed'))
         n_half_total = len(qc_results.get('convergence_check', []))
         print("\n=== QC Report ===")
-        print(f"Overlap checks: {n_ol_pass}/{n_ol_total} passed (region-aware thresholds)")
-        print(f"ESS checks:     {n_ess_pass}/{n_ess_total} passed (region-aware thresholds)")
-        print(f"Half-time:      {n_half_pass}/{n_half_total} passed (ΔE + Z, region-aware; drift_tol {self.qc_config.get('drift_tolerance_nm_per_ns',0.1)} nm/ns)")
+        print(f"Overlap checks: {n_ol_pass}/{n_ol_total} passed")
+        print(f"ESS checks:     {n_ess_pass}/{n_ess_total} passed (threshold {self.qc_config.get('min_ess_frames',200)})")
+        print(f"Half-time:      {n_half_pass}/{n_half_total} passed (ΔE_tol {self.qc_config.get('half_energy_tol_kj',2.0)} kJ/mol, drift_tol {self.qc_config.get('drift_tolerance_nm_per_ns',0.1)} nm/ns)")
         for check in qc_results.get('overlap_check', []):
             if not check['passed']:
                 print(f"  ⚠ Low overlap ({check['overlap']:.3f}) between z={check['windows'][0]:.2f} and z={check['windows'][1]:.2f}")
         return report_file
-
-    def _filter_windows_by_qc(self, windows_data, pmf_dir: Path):
-        """Filter out bad replicates per center based on QC criteria.
-
-        Criteria come from pmf.qc.filter:
-          - drop_if_half_fail (bool)
-          - drop_if_drift_fail (bool)
-          - min_ess_keep (int)
-          - min_keep_per_center (int)
-          - keep_best_if_all_filtered (bool)
-          - prefer_by: 'ess' | 'half_then_ess'
-
-        Returns (selected_windows, selection_report)
-        selection_report is a dict with center-wise details and reasons.
-        """
-        fcfg = (self.qc_config.get('filter') or {})
-        if not bool(fcfg.get('enabled', True)):
-            return [w for w in windows_data if w], {}
-        drop_half = bool(fcfg.get('drop_if_half_fail', True))
-        drop_drift = bool(fcfg.get('drop_if_drift_fail', False))
-        min_ess = int(fcfg.get('min_ess_keep', 20))
-        min_keep = int(fcfg.get('min_keep_per_center', 1))
-        keep_best_anyway = bool(fcfg.get('keep_best_if_all_filtered', True))
-        prefer_by = str(fcfg.get('prefer_by', 'ess')).lower()
-
-        # Group windows by center
-        centers = {}
-        for w in [w for w in windows_data if w]:
-            centers.setdefault(float(w['center']), []).append(w)
-
-        k = float(self.umbrella_config.get('force_constant', 900))
-        selection = {}
-        selected_windows = []
-        for c, wins in sorted(centers.items(), key=lambda kv: kv[0], reverse=True):
-            items = []
-            for w in wins:
-                reg = self._region_cfg(w['center'])
-                qc = self.compute_window_qc(w['pullx'], k, w['center'], reg.get('half_energy_tol_kj', 2.0))
-                # Region-aware half decision (ΔE + Z)
-                half_pass_reg = (float(qc.get('half_energy_diff_kj', float('inf'))) <= float(reg["half_energy_tol_kj"])) and \
-                                (float(qc.get('half_z_stat', 0.0)) <= float(reg["half_z_tol_sigma"]))
-                reason = []
-                drop = False
-                if drop_half and not half_pass_reg:
-                    drop = True; reason.append('half_fail')
-                if drop_drift and not qc.get('drift_pass', True):
-                    drop = True; reason.append('drift_fail')
-                if int(qc.get('ess', 0)) < min_ess:
-                    drop = True; reason.append(f"ess<{min_ess}")
-                items.append({
-                    'center': float(c),
-                    'pullx': w['pullx'],
-                    'pullf': w['pullf'],
-                    'tpr': w.get('tpr'),
-                    'seed': w.get('seed'),
-                    'qc': {
-                        'ess': int(qc.get('ess', 0)),
-                        'half_pass': bool(half_pass_reg),
-                        'drift_pass': bool(qc.get('drift_pass', True)),
-                        'half_energy_diff_kj': float(qc.get('half_energy_diff_kj', 0.0)),
-                        'drift_nm_per_ns': float(qc.get('drift_nm_per_ns', 0.0)) if qc.get('drift_nm_per_ns') is not None else None,
-                    },
-                    'drop': bool(drop),
-                    'reason': reason,
-                })
-            # Select survivors
-            survivors = [it for it in items if not it['drop']]
-            if len(survivors) < min_keep:
-                if keep_best_anyway and items:
-                    # sort by preference
-                    if prefer_by.startswith('half'):
-                        items_sorted = sorted(items, key=lambda it: ((not it['qc']['half_pass']), -it['qc']['ess']))
-                    else:
-                        items_sorted = sorted(items, key=lambda it: (-it['qc']['ess']))
-                    survivors = items_sorted[:max(1, min_keep)]
-                else:
-                    survivors = []
-            selection[float(c)] = {
-                'replicates': items,
-                'selected': [{'pullx': it['pullx'], 'ess': it['qc']['ess'], 'half_pass': it['qc']['half_pass']} for it in survivors],
-                'n_selected': len(survivors),
-                'n_total': len(items),
-                'ess_sum_selected': int(sum(it['qc']['ess'] for it in survivors))
-            }
-            # Append survivors in original window dict form
-            px_to_win = {w['pullx']: w for w in wins}
-            for it in survivors:
-                sel = px_to_win.get(it['pullx'])
-                if sel:
-                    selected_windows.append(sel)
-
-        # Write selection report
-        try:
-            with open(pmf_dir / 'qc_filter.yaml', 'w') as f:
-                yaml.dump(selection, f, default_flow_style=False)
-        except Exception:
-            pass
-        return selected_windows, selection
     
     def _scan_existing_windows(self, pmf_dir: Path):
-        """Return list of window dicts for existing window outputs, including replicates.
-
-        Scans windows/z_*/ and windows/z_*/rep_*/ for pullx/pullf/tpr entries.
-        """
+        """Return list of window dicts for existing window outputs."""
         windows_root = pmf_dir / "windows"
         if not windows_root.exists():
             return []
         wins = []
-
-        def _append_entry(dir_path: Path, center: float):
-            pullx = dir_path / "pullx.xvg"
-            pullf = dir_path / "pullf.xvg"
-            tpr = dir_path / "umbrella.tpr"
-            if pullx.exists():
-                wins.append({
-                    "center": float(center),
-                    "pullf": str(pullf),
-                    "pullx": str(pullx),
-                    "tpr": str(tpr)
-                })
-
-        for zdir in sorted(windows_root.glob("z_*")):
+        for d in sorted(windows_root.glob("z_*")):
+            pullx = d / "pullx.xvg"
+            pullf = d / "pullf.xvg"
+            tpr = d / "umbrella.tpr"
+            if not pullx.exists():
+                continue
+            # parse center from folder name 'z_+0.700'
             try:
-                m = re.match(r"z_([+-]?[0-9]+\.[0-9]+)", zdir.name)
-                if not m:
-                    continue
-                center = float(m.group(1))
+                m = re.match(r"z_([+-]?[0-9]+\.[0-9]+)", d.name)
+                center = float(m.group(1)) if m else None
             except Exception:
-                continue
-
-            # Base window
-            _append_entry(zdir, center)
-            # Replicates
-            for repdir in sorted(zdir.glob("rep_*")):
-                _append_entry(repdir, center)
-
-        # No dedup by center here; we keep all replicates
-        # Optionally dedup exact duplicates by (center, pullx)
-        seen = set(); kept = []
+                center = None
+            if center is None:
+                # try fallback: read center from mdp header
+                center = None
+            wins.append({
+                "center": center,
+                "pullf": str(pullf),
+                "pullx": str(pullx),
+                "tpr": str(tpr)
+            })
+        # Filter entries without center
+        wins = [w for w in wins if w.get("center") is not None]
+        # Deduplicate by center
+        out = {}
         for w in wins:
-            key = (float(w['center']), w.get('pullx'))
-            if key in seen:
-                continue
-            seen.add(key); kept.append(w)
-        return kept
+            out[_round3(w['center'])] = w
+        return [out[k] for k in sorted(out.keys(), reverse=True)]
 
     def run_pmf_calculation(self, replicate=1, tag=None, resume=False, qc_only=False):
         """Main PMF calculation workflow with all improvements"""
@@ -2358,60 +1865,26 @@ pull-coord1-start       = yes
             if result and self.umbrella_config.get('use_previous_frame', False):
                 start_structure = window_dir / "umbrella.gro"
 
-        # Optional: deduplicate exact duplicates by (center, pullx) while keeping replicates
-        seen = set(); kept = []
+        # Deduplicate windows by center (keep last occurrence, typically most recent/extended)
+        uniq = {}
         for w in windows_data:
             if not w:
                 continue
-            key = (float(w['center']), w.get('pullx'))
-            if key in seen:
-                continue
-            seen.add(key)
-            kept.append(w)
-        windows_data = kept
+            uniq[_round3(w['center'])] = w
+        windows_data = [uniq[k] for k in sorted(uniq.keys(), reverse=True)]
 
-        # QC loop with auto-densify/extend until gates pass (ESS + overlap)
-        # If qc.max_qc_rounds <= 0, run indefinitely until gates pass or no further changes are possible.
+        # QC loop with auto-densify/extend
         max_rounds = int(self.qc_config.get('max_qc_rounds', 5))
-        # If qc.until_gates_pass is true (default), ignore max_rounds and run until gates are satisfied
-        until_pass = bool(self.qc_config.get('until_gates_pass', True))
-        unlimited = until_pass or (max_rounds <= 0)
         all_centers = [w['center'] for w in windows_data if w]
-        round_idx = 0
-        while True:
-            # Initialize per-round log
-            round_log = {
-                "round": round_idx + 1,
-                "added": [],
-                "extended": [],
-                "replicated": [],
-                "reasons": {"overlap_pairs": [], "gaps": []},
-            }
+        for round_idx in range(max_rounds):
             qc_results = self.run_qc_checks(windows_data)
-            overlap_ok, ess_ok = self._qc_gates_passed(qc_results)
-            if overlap_ok and ess_ok:
-                self.logger.info(f"QC gates satisfied after {round_idx} round(s).")
-                # Still persist a round entry showing no actions
-                self.round_history.append(round_log)
-                break
-
             to_add = []
             # Add midpoint windows for low-overlap neighbors
-            for check in qc_results.get('overlap_check', []):
-                if not check.get('passed', False):
+            for check in qc_results['overlap_check']:
+                if not check['passed']:
                     mid = _round3(0.5*(check['windows'][0] + check['windows'][1]))
                     if mid not in all_centers:
                         to_add.append(mid)
-                        try:
-                            round_log["reasons"]["overlap_pairs"].append({
-                                "z1": float(check['windows'][0]),
-                                "z2": float(check['windows'][1]),
-                                "overlap": float(check.get('overlap', 0.0)),
-                                "min_required": float(check.get('min_required', 0.0)),
-                                "mid": float(mid),
-                            })
-                        except Exception:
-                            pass
             # Add midpoint windows for large geometric gaps (safety)
             k = float(self.umbrella_config.get('force_constant', 900))
             dz_max = _dz_max_for_overlap(float(self.temperature_K), k, float(self.target_overlap))
@@ -2421,23 +1894,7 @@ pull-coord1-start       = yes
                     mid = _round3(0.5*(a+b))
                     if mid not in all_centers:
                         to_add.append(mid)
-                        try:
-                            round_log["reasons"]["gaps"].append({
-                                "z1": float(a), "z2": float(b), "mid": float(mid), "dz": float(abs(a-b))
-                            })
-                        except Exception:
-                            pass
             to_add = _dedup_sorted_centers(to_add)
-            # Respect max windows budget if configured
-            try:
-                max_w = int(self.qc_config.get('max_windows', 10**9))
-                current_n = len(_dedup_sorted_centers([w['center'] for w in windows_data if w]))
-                remaining = max(0, max_w - current_n)
-                if len(to_add) > remaining:
-                    to_add = to_add[:remaining]
-            except Exception:
-                pass
-            added = 0
             if to_add:
                 self.logger.info(f"QC round {round_idx+1}: adding {len(to_add)} windows to improve coverage/overlap")
                 for new_center in to_add:
@@ -2446,64 +1903,15 @@ pull-coord1-start       = yes
                     if res:
                         windows_data.append(res)
                         all_centers.append(new_center)
-                        added += 1
-                        round_log["added"].append({"center": float(new_center), "reason": "overlap/gap"})
-
             # After densification in this round, try extending windows that failed ESS/half-time
             qc_results = self.run_qc_checks(windows_data)
-            windows_data, extended, extended_entries = self._extend_failed_windows(
-                pmf_dir, windows_data, qc_results, start_structure, replicate
-            )
-            if extended_entries:
-                round_log["extended"].extend(extended_entries)
-            # Round summary logging
-            try:
-                self.logger.info(f"QC round {round_idx+1} summary: added={added}, extended={len(extended_entries)}")
-            except Exception:
-                pass
-
-            # Decide whether to continue
-            round_idx += 1
-            if not unlimited and round_idx >= max_rounds and not (overlap_ok and ess_ok):
-                self.logger.warning("Reached max_qc_rounds before all QC gates passed.")
-                self.round_history.append(round_log)
+            windows_data = self._extend_failed_windows(pmf_dir, windows_data, qc_results, start_structure, replicate)
+            # Continue to next round; QC will be recomputed at top
+            if not to_add:
                 break
-            if added == 0 and extended == 0:
-                # No more actions possible; avoid infinite loop
-                self.logger.warning("QC gates not fully satisfied, but no windows were added or extended in this round. Stopping.")
-                self.round_history.append(round_log)
-                break
-            # Persist per-round log
-            self.round_history.append(round_log)
-        # Final QC report (pre-fallback)
+        # Final QC report
         qc_results = self.run_qc_checks(windows_data)
-        overlap_ok, ess_ok = self._qc_gates_passed(qc_results)
-        if not (overlap_ok and ess_ok):
-            self.logger.warning("QC gates not fully satisfied after QC rounds. Engaging fallback replicates…")
-            windows_data, added, replicated_entries = self._replicate_low_ess_windows(
-                pmf_dir, windows_data, qc_results, start_structure, replicate
-            )
-            # Fallback logged as a dedicated round
-            if replicated_entries:
-                self.round_history.append({
-                    "round": round_idx + 1,  # next sequential
-                    "added": [],
-                    "extended": [],
-                    "replicated": replicated_entries,
-                    "reasons": {"overlap_pairs": [], "gaps": []},
-                    "note": "fallback",
-                })
-                try:
-                    self.logger.info(f"QC fallback summary: replicated={len(replicated_entries)}")
-                except Exception:
-                    pass
-            # Re-check QC after fallback
-            qc_results = self.run_qc_checks(windows_data)
         self.generate_qc_report(qc_results, pmf_dir)
-        # Select good replicates per center and update metadata payload
-        windows_selected, selection = self._filter_windows_by_qc(windows_data, pmf_dir)
-        if windows_selected:
-            windows_data = windows_selected
         # Consistency validation
         self.validate_window_consistency(pmf_dir, windows_data)
 
@@ -2525,9 +1933,6 @@ pull-coord1-start       = yes
             "windows": windows_data,
             "qc_results": qc_results
         }
-        # Persist selection summary for traceability
-        if selection:
-            metadata['qc_selection'] = selection
 
         metadata_file = pmf_dir / "pmf_metadata.yaml"
         with open(metadata_file, 'w') as f:

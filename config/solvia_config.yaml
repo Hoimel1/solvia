@@ -200,7 +200,7 @@ pmf:
     target_overlap: 0.20         # Target for auto-densification
     min_ess_frames: 200          # Effective sample size threshold
     half_energy_tol_kj: 2.0      # Half-time energy difference tolerance (kJ/mol)
-    max_qc_rounds: 3             # Densify/extend cycles
+    max_qc_rounds: 5             # Densify/extend cycles
     auto_extend: true            # Automatically extend failing windows
     extend_ns: 10.0              # Per-iteration extension
     max_extend_ns: 20.0          # Cap per window

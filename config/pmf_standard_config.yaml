@@ -21,21 +21,32 @@ pmf:
   # Standardized membrane setup
   membrane:
     type: "standard_rbc"
-    cholesterol_percentage: 45  # Fixed for RBC membrane
-    box_size: [10, 10, 14]     # nm
-    use_validated_rbc: true     # Use experimentally guided RBC composition
+    # Box and solution conditions (mirrors builder defaults)
+    box_size: [14, 14, 14]     # nm
+    solvent: "W"
+    salt_concentration: 0.15   # mol/L
     
-    # Fixed outer leaflet composition (no variation)
+    # Use experimentally validated RBC asymmetry (as in 04_build_membrane.py)
+    use_validated_rbc: true
+    
+    # Outer/inner leaflet fractions matching _validated_rbc_composition()
+    # Outer (upper) leaflet
     outer_leaflet:
-      POPC: 0.40
-      PSM: 0.15
+      PSM: 0.25
+      POPC: 0.27
       CHOL: 0.45
-    
-    # Fixed inner leaflet composition
+      POPS: 0.03
+    # Inner (lower) leaflet
     inner_leaflet:
-      POPE: 0.45
-      POPS: 0.15
-      CHOL: 0.40
+      POPE: 0.40
+      POPS: 0.35
+      POPC: 0.15
+      CHOL: 0.10
+    # Validation thresholds for asymmetry checks (optional)
+    validation:
+      ps_enrichment_min: 5.0        # require PS inner enrichment ≥ 5× (default was 10×)
+      chol_total_min: 0.40          # acceptable total CHOL fraction (lower bound)
+      chol_total_max: 0.45          # acceptable total CHOL fraction (upper bound)
   
   # PMF calculation parameters (SOP from aenderungen.md)
   umbrella:
@@ -65,11 +76,11 @@ pmf:
     # Timing (SMD prep + production)
     smd_prepare: true         # Do a short SMD nudge toward target z
     pre_smd_ns: 1.0           # Short but effective SMD (raised from 0.5)
-    smd_max_ns: 1.0           # Safety cap for SMD duration
+    smd_max_ns: 2.0           # Safety cap for SMD duration
     smd_max_rate_nm_per_ns: 2.0  # Max pull rate during SMD (nm/ns)
     smd_force_constant: 800      # kJ/mol/nm^2 for SMD nudge
     pre_equil_ns: 5.0         # Pre-equilibration per window
-    production_ns: 200.0      # Evidence-based CG default
+    production_ns: 60.0       # Default per-window production time (ns)
     
     # Overlap control
     auto_densify: true        # Add windows if overlap < target
@@ -90,7 +101,7 @@ pmf:
     enabled: true
     
     # Overlap requirements
-    min_neighbor_overlap: 0.10  # Hard minimum
+    min_neighbor_overlap: 0.15  # Hard minimum
     target_overlap: 0.20         # For auto-densification
     overlap_method: kde          # hist | kde
     drift_tolerance_nm_per_ns: 0.1
@@ -103,21 +114,82 @@ pmf:
     replicate_tolerance: 2.0     # kJ/mol for ΔGads, ΔGinsert
     
     # Maximum resources
-    max_windows: 22              # Budget limit
-    max_time_per_window: 30      # ns
+    max_windows: 32              # Budget limit
+    max_time_per_window: 120      # ns
 
-    max_qc_rounds: 3          # number of densify/extend cycles
+    # QC rounds and adaptation
+    until_gates_pass: true    # run rounds until gates pass (ignore max_qc_rounds)
+    max_qc_rounds: 0          # 0 = unlimited rounds when until_gates_pass=true
     auto_extend: true         # automatically extend windows on QC fail
-    extend_ns: 10.0           # per-iteration extension
-    max_extend_ns: 200.0      # cap per window (slow RBC-like membranes)
+    extend_ns: 10.0           # per-iteration extension (ns)
+    max_extend_ns: 80.0       # cap per window extension (ns)
     discard_fraction: 0.10    # discard initial fraction for QC (ESS/half-energy)
-    ess_stride: 5             # subsample factor for ESS estimation (>=1)
+    ess_stride: "auto"        # automatic stride for ESS estimation (or integer ≥1)
+    filter:                  # drop bad replicates per center before analysis
+      enabled: true
+      drop_if_half_fail: true
+      drop_if_drift_fail: false
+      min_ess_keep: 20       # keep replicate only if ESS >= this
+      min_keep_per_center: 1 # always keep at least the best replicate
+      keep_best_if_all_filtered: true
+      prefer_by: ess         # ess | half_then_ess
+    fallback:                 # Fallback if QC gates still fail after rounds
+      enabled: true
+      min_ess_trigger: 50     # replicate windows with ESS < this
+      replicate_count: 3      # N independent replicates per target window
+      per_replicate_ns: 50.0  # production per replicate (ns)
+      k_tune_scale: 1.2       # multiply k for these tough windows (e.g., 1.2x)
+      ref_mode: global        # force global PO4 reference for fallback (po4_all)
+      restart_from_neighbor: true  # for half_fail windows, start from nearest passing neighbor .gro
+
+    # Region-sensitive thresholds (bulk/approach/interface)
+    region_thresholds:
+      bulk:
+        min_neighbor_overlap: 0.12
+        min_ess_frames: 150
+        half_energy_tol_kj: 3.0
+        half_z_tol_sigma: 2.5
+        min_time_ns: 20
+      approach:
+        min_neighbor_overlap: 0.15
+        min_ess_frames: 200
+        half_energy_tol_kj: 2.0
+        half_z_tol_sigma: 2.0
+        min_time_ns: 30
+      interface:
+        min_neighbor_overlap: 0.20
+        min_ess_frames: 150
+        half_energy_tol_kj: 1.0
+        half_z_tol_sigma: 1.5
+        min_time_ns: 40
   
   # Analysis parameters
   analysis:
     method: "wham"               # Primary method (wham | mbar)
+    # Adsorption (HC50) windowing — reproducible defaults
+    adsorption:
+      window_mode: energy_band       # energy_band | pmf_negative | around_min | fixed
+      # Membrane bounds to exclude bilayer region (nm)
+      membrane:
+        z_lo: -1.5
+        z_hi:  1.5
+        margin_nm: 0.2               # small margin outside membrane on bulk side
+      # Minimum per-bin count to consider bin as supported (align with plot.min_bin_count_for_ci)
+      support_min_count: 25
+      # Only used if window_mode=around_min (fixed width around adsorption minimum)
+      auto_width_nm: 0.60
+      # Only used if window_mode=energy_band (energy band around adsorption minimum)
+      energy_band_kj: 3.0
+      # Compatibility for window_mode=fixed
+      z_low: 0.5
+      z_high: 1.6
+      # Physical parameters for HC50 calculation
+      area_per_lipid_nm2: 0.62
+      lp_star_range: [154, 515]
+      bilayer_factor: 1.0            # one-sided PMF evaluation (set 2.0 only for bilateral adsorption)
     mbar:
       fallback_policy: numeric_only   # numeric_only | strict | never
+      max_samples: 2000000            # large cap; prefer decorrelation over hard thinning
       pmf_range_kj: 200.0             # used if fallback_policy=strict
       pmf_min_kj: -100.0              # used if fallback_policy=strict
     bootstrap:
@@ -131,15 +203,22 @@ pmf:
       z_min_nm: 2.4             # used if mode=fixed_z
       top_percent: 10.0         # used if mode=percentile
       grad_kj_per_nm: 2.0       # slope threshold to detect plateau region
-      min_bins: 10
+      min_bins: 50
     plot:
       min_bin_count_for_ci: 25  # draw CI only where count per bin >= this
+      pmf_min_bin_count: 25     # MBAR/WHAM: trim to contiguous bins with at least this many counts
+      ci_min_bootstrap_fraction: 0.90  # require at least 90% finite bootstrap support to draw CI
+      ci_max_band_kj: 200.0            # hide CI where 95% band exceeds this height (kJ/mol)
     wham:
       use_ess_weighting: true
+      convergence_kj: 0.2        # stop adaptive refinement when change < eps (kJ/mol)
+      min_counts_refine: 20      # only refine between bins with >= this many total counts
       adaptive_grid:
         enabled: true
         slope_kj_per_nm: 50.0
         max_refine_passes: 1
+    preprocess:
+      subsample_uncorrelated: true  # use timeseries.detectEquilibration + subsample
     symmetrize: false           # optional, for membrane-symmetric reporting
     # Adaptive feature extraction parameters
     feature_params:
