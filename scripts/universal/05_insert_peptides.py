@@ -14,6 +14,7 @@ import math
 import zlib
 from pathlib import Path
 import logging
+import re
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
@@ -64,7 +65,9 @@ def get_peptide_dimensions(peptide_gro):
             z = float(line[36:44])
             coords.append([x, y, z])
     
-    coords = np.array(coords)
+    coords = np.array(coords, dtype=float)
+    if coords.size == 0:
+        raise ValueError(f"No atoms parsed from {peptide_gro}")
     dimensions = coords.max(axis=0) - coords.min(axis=0)
     center = coords.mean(axis=0)
     
@@ -79,25 +82,34 @@ def find_membrane_top(membrane_gro):
     _, _, atom_lines, box_line = read_gro_file(membrane_gro)
     po4_z = []
     for line in atom_lines:
-        if len(line) > 44 and 'PO4' in line:
+        if len(line) > 44:
             try:
-                z = float(line[36:44])
-                po4_z.append(z)
+                atomname = line[10:15].strip()
+                if atomname in ("PO4", "P"):
+                    z = float(line[36:44])
+                    po4_z.append(z)
             except Exception:
                 continue
     if po4_z:
-        zs = sorted(po4_z)
-        zmed = zs[len(zs)//2]
+        zmed = float(np.median(po4_z))
         upper = [z for z in po4_z if z >= zmed]
         if upper:
             return float(np.mean(upper))
-    # Fallback: estimate based on box height
+    # Fallbacks: (1) robust parse box z, (2) median of all z, (3) conservative 5.0 nm
     try:
-        box_z = float(box_line.split()[2])
-        return box_z * 0.5
-    except Exception as e:
-        logging.warning(f"Could not parse box line for fallback membrane top: {e}")
-        return 8.5
+        vals = re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", box_line or "")
+        if len(vals) >= 3:
+            return 0.5 * float(vals[2])
+    except Exception:
+        pass
+    try:
+        zs_all = [float(line[36:44]) for line in atom_lines if len(line) > 44]
+        if zs_all:
+            return float(np.median(zs_all))
+    except Exception:
+        pass
+    logging.warning("Could not determine membrane top; using conservative midplane 5.0 nm")
+    return 5.0
 
 def _pbc_d2(x: float, y: float, px: float, py: float, width: float, height: float) -> float:
     dx = abs(x - px)
@@ -106,20 +118,19 @@ def _pbc_d2(x: float, y: float, px: float, py: float, width: float, height: floa
     dy = min(dy, height - dy)
     return dx*dx + dy*dy
 
-def _poisson_disk_sample(n_points: int, width: float, height: float, min_dist: float, 
+def _poisson_disk_sample(n_points: int, width: float, height: float, min_dist: float,
                          rng: np.random.Generator, max_attempts: int = 10000) -> list:
     """Simple Poisson-disk sampling with PBC-aware distance in XY.
 
-    Samples in [margin, width-margin] × [margin, height-margin].
+    Samples in [0,width) × [0,height) with PBC-aware spacing.
     """
-    margin = min_dist
     points: list[list[float]] = []
     attempts = 0
     r2 = (min_dist ** 2)
     while len(points) < n_points and attempts < max_attempts:
         attempts += 1
-        x = float(rng.uniform(margin, max(margin, width - margin)))
-        y = float(rng.uniform(margin, max(margin, height - margin)))
+        x = float(rng.uniform(0.0, width))
+        y = float(rng.uniform(0.0, height))
         ok = True
         for px, py in points:
             if _pbc_d2(x, y, px, py, width, height) < r2:
@@ -195,42 +206,46 @@ def calculate_peptide_positions(n_peptides, box_size, spacing, placement: str, r
                     rep_scale=rep_scale, att_scale=att_scale
                 )
             return pts
+        else:
+            try:
+                logging.warning(f"Poisson placed {len(pts)}/{n_peptides}; falling back to grid.")
+            except Exception:
+                pass
 
     if n_peptides == 1:
         positions = [[box_size[0] / 2.0, box_size[1] / 2.0]]
-    elif n_peptides == 8:
-        # 3-2-3 arrangement
-        rows = [3, 2, 3]
-        y_positions = [2.5, 5.0, 7.5]  # nm
-        
-        for row_idx, (n_in_row, y_pos) in enumerate(zip(rows, y_positions)):
-            if n_in_row == 3:
-                x_positions = [2.5, 5.0, 7.5]
-            else:  # n_in_row == 2
-                x_positions = [3.5, 6.5]  # Offset for staggered arrangement
-            
-            for x_pos in x_positions:
-                positions.append([x_pos, y_pos])
-    
-    elif n_peptides == 12:
-        # 4-4-4 arrangement
-        for y in [2.0, 4.0, 6.0, 8.0]:
-            for x in [2.0, 4.0, 6.0, 8.0]:
-                positions.append([x, y])
-                if len(positions) >= n_peptides:
-                    break
-    
-    elif n_peptides == 16:
-        # 4x4 grid
-        for y in np.linspace(1.5, 8.5, 4):
-            for x in np.linspace(1.5, 8.5, 4):
-                positions.append([x, y])
+    elif n_peptides in (8, 12, 16):
+        # Box-scaled staggered/grid arrangements
+        W, H = float(box_size[0]), float(box_size[1])
+        margin = max(spacing * 0.5, 0.5)
+        if n_peptides == 8:
+            rows = [3, 2, 3]
+            ys = np.linspace(margin, max(margin, H - margin), num=3)
+            for n_in_row, y_pos in zip(rows, ys):
+                xs = np.linspace(margin, max(margin, W - margin), num=n_in_row)
+                for x_pos in xs:
+                    positions.append([float(x_pos), float(y_pos)])
+        elif n_peptides == 12:
+            # 4-4-4 across H
+            ys = np.linspace(margin, max(margin, H - margin), num=3)
+            xs = np.linspace(margin, max(margin, W - margin), num=4)
+            for y in ys:
+                for x in xs:
+                    positions.append([float(x), float(y)])
+        elif n_peptides == 16:
+            # 4x4 grid
+            ys = np.linspace(margin, max(margin, H - margin), num=4)
+            xs = np.linspace(margin, max(margin, W - margin), num=4)
+            for y in ys:
+                for x in xs:
+                    positions.append([float(x), float(y)])
     
     else:
         # Generic fallback grid
         grid_n = int(np.ceil(np.sqrt(n_peptides)))
-        xs = np.linspace(1.5, max(1.6, box_size[0] - 1.5), grid_n)
-        ys = np.linspace(1.5, max(1.6, box_size[1] - 1.5), grid_n)
+        margin = max(spacing * 0.5, 0.5)
+        xs = np.linspace(margin, max(margin, box_size[0] - margin), grid_n)
+        ys = np.linspace(margin, max(margin, box_size[1] - margin), grid_n)
         for y in ys:
             for x in xs:
                 positions.append([float(x), float(y)])
@@ -416,7 +431,8 @@ def insert_peptides(run_dir, occupancy="low", n_peptides_override=None, placemen
         n_peptides = int(n_peptides_override)
         occupancy_label = f"n{n_peptides}"
     else:
-        n_peptides = config['peptide_insertion']['occupancy_levels'][occupancy]
+        levels = (config.get('peptide_insertion') or {}).get('occupancy_levels', {})
+        n_peptides = int(levels.get(occupancy, 1))
         occupancy_label = occupancy
     
     # Input files
@@ -438,14 +454,15 @@ def insert_peptides(run_dir, occupancy="low", n_peptides_override=None, placemen
     os.makedirs(output_dir, exist_ok=True)
     logging.info(f"Inserting {n_peptides} peptide(s) ({occupancy_label}), replicates={replicates}...")
     
-    # Convert PDB to GRO if needed
+    # Read membrane to obtain box info first
+    membrane_header, membrane_natoms, membrane_atoms, box_line = read_gro_file(membrane_gro)
+    # Convert PDB to GRO if needed (use membrane box)
     if peptide_gro.endswith('.pdb'):
         peptide_gro_temp = peptide_gro.replace('.pdb', '.gro')
-        convert_pdb_to_gro(peptide_gro, peptide_gro_temp)
+        convert_pdb_to_gro(peptide_gro, peptide_gro_temp, box_line=box_line)
         peptide_gro = peptide_gro_temp
-    
-    # Read files
-    membrane_header, membrane_natoms, membrane_atoms, box_line = read_gro_file(membrane_gro)
+
+    # Read peptide GRO
     peptide_header, peptide_natoms, peptide_atoms, _ = read_gro_file(peptide_gro)
     
     # Get dimensions
@@ -455,6 +472,8 @@ def insert_peptides(run_dir, occupancy="low", n_peptides_override=None, placemen
     
     logging.info(f"Membrane top at z={membrane_top:.2f} nm")
     logging.info(f"Peptide dimensions: {peptide_dims[0]:.2f} x {peptide_dims[1]:.2f} x {peptide_dims[2]:.2f} nm")
+    spacing = float((config.get('peptide_insertion') or {}).get('minimum_spacing', 2.5))
+    logging.info(f"INFO: box=({box_size[0]:.2f},{box_size[1]:.2f},{box_size[2]:.2f}) spacing={spacing:.2f} placement={placement} orientation={orientation}")
     
     last_gro, last_top = None, None
     for rep in range(1, max(1, replicates) + 1):
@@ -471,19 +490,40 @@ def insert_peptides(run_dir, occupancy="low", n_peptides_override=None, placemen
         seed_str = f"{metadata['peptide_id']}|{n_peptides}|{occupancy_label}|rep{rep}"
         seed = zlib.crc32(seed_str.encode('utf-8')) & 0xFFFFFFFF
         rng = np.random.default_rng(seed)
+        logging.info(f"Seed info: seed_str='{seed_str}', seed={seed}, bitgen={type(rng.bit_generator).__name__}")
 
         # Calculate positions
         positions = calculate_peptide_positions(
             n_peptides,
             box_size,
-            config['peptide_insertion']['minimum_spacing'],
+            spacing,
             placement,
             rng,
             run_dir=run_dir,
             config=config
         )
-        # Base z position above membrane
-        z_position_base = membrane_top + config['peptide_insertion']['distance_from_membrane']
+        # Invariant checks on positions
+        try:
+            W, H = float(box_size[0]), float(box_size[1])
+            assert all(0.0 <= x < W and 0.0 <= y < H for x, y in positions), "Position out of XY box bounds"
+            min_d = None
+            for a in range(len(positions)):
+                xa, ya = positions[a]
+                for b in range(a + 1, len(positions)):
+                    xb, yb = positions[b]
+                    dx = abs(xa - xb); dy = abs(ya - yb)
+                    dx = min(dx, W - dx); dy = min(dy, H - dy)
+                    dxy = math.hypot(dx, dy)
+                    if min_d is None or dxy < min_d:
+                        min_d = dxy
+            if min_d is not None and min_d < spacing:
+                logging.warning(f"Min XY spacing violated: d={min_d:.2f} < spacing={spacing:.2f}")
+            logging.info(f"Placement summary: N={len(positions)} min_xy={min_d if min_d is not None else float('nan'):.2f}")
+        except AssertionError as e:
+            logging.warning(f"Invariant check failed: {e}")
+        # Base z position above membrane (robust config read)
+        dist_from_mem = float((config.get('peptide_insertion') or {}).get('distance_from_membrane', 2.5))
+        z_position_base = membrane_top + dist_from_mem
         # Optional z-jitter (per-replicate or per-peptide)
         zj_cfg = (config.get('peptide_insertion') or {}).get('z_jitter', {})
         zj_mode = str(zj_cfg.get('mode', 'none')).lower()
@@ -528,6 +568,8 @@ def insert_peptides(run_dir, occupancy="low", n_peptides_override=None, placemen
             else:
                 tilt_deg, roll_deg = _sample_tilt_roll(orientation, rng)
                 rot = _rotation_matrix_general(tilt_deg, roll_deg)
+            # Clamp z within simulation box
+            z_here = float(min(max(z_here, 0.1), box_size[2] - 0.1))
             logging.info(f"  [{rep_tag}] Placing peptide {i+1} at ({x:.1f}, {y:.1f}, {z_here:.1f}); tilt={tilt_deg:.1f}°, roll={roll_deg:.1f}°")
             
             for line in peptide_atoms:
@@ -556,10 +598,12 @@ def insert_peptides(run_dir, occupancy="low", n_peptides_override=None, placemen
                     # Rotate by combined tilt/roll
                     rx, ry, rz = rot @ np.array([vx, vy, vz])
 
-                    # Translate to target position (x,y,z)
-                    new_x = rx + x
-                    new_y = ry + y
+                    # Translate to target position (x,y,z), wrap XY into box, clamp Z per-atom
+                    W, H, Z = float(box_size[0]), float(box_size[1]), float(box_size[2])
+                    new_x = (rx + x) % W
+                    new_y = (ry + y) % H
                     new_z = rz + z_here
+                    new_z = float(min(max(new_z, 0.1), Z - 0.1))
                     
                     # Write new atom line
                     new_line = f"{resid:5d}{resname}{atomname}{atomid:5d}{new_x:8.3f}{new_y:8.3f}{new_z:8.3f}\n"
@@ -611,32 +655,48 @@ def insert_peptides(run_dir, occupancy="low", n_peptides_override=None, placemen
     return last_gro, last_top
 
 def convert_pdb_to_gro(pdb_file, gro_file, box_line=None):
-    """Convert PDB to GRO format (simple conversion)"""
+    """Convert PDB to GRO format (heuristic units + optional box from membrane)."""
     with open(pdb_file, 'r') as f:
         pdb_lines = f.readlines()
-    
-    atoms = []
+
+    raw_coords = []
+    records = []
     for line in pdb_lines:
         if line.startswith('ATOM') or line.startswith('HETATM'):
-            # Parse PDB
-            atomid = int(line[6:11])
-            atomname = line[12:16].strip()
-            resname = line[17:20].strip()
-            resid = int(line[22:26])
-            x = float(line[30:38]) / 10.0  # Convert Å to nm
-            y = float(line[38:46]) / 10.0
-            z = float(line[46:54]) / 10.0
-            
-            # Format as GRO
-            gro_line = f"{resid:5d}{resname:5s}{atomname:>5s}{atomid:5d}{x:8.3f}{y:8.3f}{z:8.3f}\n"
-            atoms.append(gro_line)
-    
+            try:
+                atomid = int(line[6:11])
+                atomname = line[12:16].strip()
+                resname = line[17:20].strip()
+                resid = int(line[22:26])
+                x = float(line[30:38])
+                y = float(line[38:46])
+                z = float(line[46:54])
+                raw_coords.append((x, y, z))
+                records.append((resid, resname, atomname, atomid))
+            except Exception:
+                continue
+    # Heuristic: if span is large (>20), assume Å and divide by 10; else assume already nm
+    scale = 1.0
+    try:
+        arr = np.array(raw_coords, dtype=float)
+        span = float((arr.max(axis=0) - arr.min(axis=0)).max()) if arr.size else 0.0
+        if span > 20.0:
+            scale = 0.1
+    except Exception:
+        scale = 0.1  # safe default
+
+    atoms = []
+    for (resid, resname, atomname, atomid), (x, y, z) in zip(records, raw_coords):
+        x *= scale; y *= scale; z *= scale
+        gro_line = f"{resid:5d}{resname:5s}{atomname:>5s}{atomid:5d}{x:8.3f}{y:8.3f}{z:8.3f}\n"
+        atoms.append(gro_line)
+
     if box_line is not None:
         if not box_line.endswith('\n'):
             box_line += '\n'
     else:
-        box_line = "  10.000  10.000  14.000\n"  # Default box
-    # Write GRO
+        # Avoid hard-coded defaults; minimal neutral box if nothing provided
+        box_line = "  5.000  5.000  5.000\n"
     with open(gro_file, 'w') as f:
         f.write("Converted from PDB\n")
         f.write(f"{len(atoms):5d}\n")
@@ -688,20 +748,21 @@ def create_system_topology(run_dir, peptide_id, n_peptides, tag, config_path=Non
         logging.warning(f"Could not determine peptide moleculetype: {e}")
 
     # Create topology
+    ffdir = (config.get('directories') or {}).get('force_fields', 'force_fields')
     top_content = f"""; System topology for {peptide_id} with tag {tag}
 ; Generated by SOLVIA peptide insertion script
 
 ; Include force field
-#include "{config['directories']['force_fields']}/martini_v3.0.0.itp"
-#include "{config['directories']['force_fields']}/martini_v3.0.0_ffbonded_v2.itp"
-#include "{config['directories']['force_fields']}/martini_v3.0.0_phospholipids_v1.itp"
-#include "{config['directories']['force_fields']}/martini_v3.0.0_phospholipids_SM_v2.itp"
-#include "{config['directories']['force_fields']}/martini_v3.0_sterols_v1.0.itp"
-#include "{config['directories']['force_fields']}/martini_v3.0.0_solvents_v1.itp"
-#include "{config['directories']['force_fields']}/martini_v3.0.0_ions_v1.itp"
+#include "{ffdir}/martini_v3.0.0.itp"
+#include "{ffdir}/martini_v3.0.0_ffbonded_v2.itp"
+#include "{ffdir}/martini_v3.0.0_phospholipids_v1.itp"
+#include "{ffdir}/martini_v3.0.0_phospholipids_SM_v2.itp"
+#include "{ffdir}/martini_v3.0_sterols_v1.0.itp"
+#include "{ffdir}/martini_v3.0.0_solvents_v1.itp"
+#include "{ffdir}/martini_v3.0.0_ions_v1.itp"
 
 ; Include peptide topology (centralized in force_fields)
-#include "{config['directories']['force_fields']}/{peptide_id}.itp"
+#include "{ffdir}/{peptide_id}.itp"
 
 [ system ]
 {n_peptides} {peptide_id} peptides in RBC membrane

@@ -1,5 +1,5 @@
 ; This file was generated using the following command:
-; /opt/conda/bin/martinize2 -f /work/simulations/solvia_1_run_2/colabfold/best_model.pdb -ff martini3001 -x /work/simulations/solvia_1_run_2/coarse_grain/SOLVIA_1_cg.pdb -o /work/simulations/solvia_1_run_2/coarse_grain/SOLVIA_1.itp -name SOLVIA_1 -cter NH2-ter -maxwarn 1 -cys auto -dssp -p backbone -pf 1000
+; /opt/conda/bin/martinize2 -f /work/simulations/solvia_1_run_1/colabfold/best_model.pdb -ff martini3001 -x /work/simulations/solvia_1_run_1/coarse_grain/SOLVIA_1_cg.pdb -o /work/simulations/solvia_1_run_1/coarse_grain/SOLVIA_1.itp -name SOLVIA_1 -cter NH2-ter -maxwarn 1 -cys auto -dssp -p backbone -pf 1000
 ; martinize with vermouth 0.14.0
 ; The following sequence of secondary structure 
 ; was used for the full system:

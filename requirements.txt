@@ -1,9 +1,0 @@
-# Minimal requirements for production MD pipeline (host-side utils only)
-pyyaml==6.0.1
-tqdm==4.66.1
-numpy==1.24.3
-scipy==1.11.4
-matplotlib==3.7.2
-biopython==1.81
-MDAnalysis==2.6.1
-vermouth

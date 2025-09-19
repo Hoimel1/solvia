@@ -1,0 +1,207 @@
+; This file was generated using the following command:
+; /opt/conda/bin/martinize2 -f /work/simulations/solvia_1023_run_1/colabfold/best_model.pdb -ff martini3001 -x /work/simulations/solvia_1023_run_1/coarse_grain/SOLVIA_1023_cg.pdb -o /work/simulations/solvia_1023_run_1/coarse_grain/SOLVIA_1023.itp -name SOLVIA_1023 -cter NH2-ter -maxwarn 1 -cys auto -dssp -p backbone -pf 1000
+; martinize with vermouth 0.14.0
+; The following sequence of secondary structure 
+; was used for the full system:
+; CHHHHHHHHHHHHC
+
+; Please cite the following papers:
+; Souza, P C T; Alessandri, R; Barnoud, J; Thallmair, S; Faustino, I; Grünewald, F; Patmanidis, I; Abdizadeh, H; Bruininks, B M H; Wassenaar, T A; Kroon, P C; Melcr, J; Nieto, V; Corradi, V; Khan, H M; Domański, J; Javanainen, M; Martinez-Seara, H; Reuter, N; Best, R B; Vattulainen, I; Monticelli, L; Periole, X; Tieleman, D P; de Vries, A H; Marrink, S J;  Nature Methods 2021; 10.1038/s41592-021-01098-3
+; McGibbon, R T; Beauchamp, K A; Harrigan, M P; Klein, C; Swails, J M; Hernández, C X; Schwantes, C R; Wang, L; Lane, T J; Pande, V S;  Biophysical Journal 2015; 10.1016/j.bpj.2015.08.015
+; Kroon, P C; Grunewald, F; Barnoud, J; van Tilburg, M; Souza, P C; Wassenaar, T A; Marrink, S J;  elife 2024; 10.7554/elife.90627.2
+
+#ifndef POSRES_FC
+#define POSRES_FC 1000.0
+#endif
+
+[ moleculetype ]
+SOLVIA_1023 1
+
+[ atoms ]
+ 1 Q5    1 ARG BB   1   1 
+ 2 SC3   1 ARG SC1  2 0.0 
+ 3 SQ3p  1 ARG SC2  3 1.0 
+ 4 P2    2 LEU BB   4 0.0 
+ 5 SC2   2 LEU SC1  5 0.0 
+ 6 P2    3 LEU BB   6 0.0 
+ 7 SC2   3 LEU SC1  7 0.0 
+ 8 P2    4 ARG BB   8 0.0 
+ 9 SC3   4 ARG SC1  9 0.0 
+10 SQ3p  4 ARG SC2 10 1.0 
+11 P2    5 LEU BB  11 0.0 
+12 SC2   5 LEU SC1 12 0.0 
+13 P2    6 LEU BB  13 0.0 
+14 SC2   6 LEU SC1 14 0.0 
+15 P2    7 ARG BB  15 0.0 
+16 SC3   7 ARG SC1 16 0.0 
+17 SQ3p  7 ARG SC2 17 1.0 
+18 P2    8 ARG BB  18 0.0 
+19 SC3   8 ARG SC1 19 0.0 
+20 SQ3p  8 ARG SC2 20 1.0 
+21 P2    9 LEU BB  21 0.0 
+22 SC2   9 LEU SC1 22 0.0 
+23 P2   10 LEU BB  23 0.0 
+24 SC2  10 LEU SC1 24 0.0 
+25 P2   11 ARG BB  25 0.0 
+26 SC3  11 ARG SC1 26 0.0 
+27 SQ3p 11 ARG SC2 27 1.0 
+28 P2   12 LEU BB  28 0.0 
+29 SC2  12 LEU SC1 29 0.0 
+30 P2   13 LEU BB  30 0.0 
+31 SC2  13 LEU SC1 31 0.0 
+32 P6   14 ARG BB  32   0 
+33 SC3  14 ARG SC1 33 0.0 
+34 SQ3p 14 ARG SC2 34 1.0 
+
+[ position_restraints ]
+#ifdef POSRES
+ 1 1 POSRES_FC POSRES_FC POSRES_FC
+ 4 1 POSRES_FC POSRES_FC POSRES_FC
+ 6 1 POSRES_FC POSRES_FC POSRES_FC
+ 8 1 POSRES_FC POSRES_FC POSRES_FC
+11 1 POSRES_FC POSRES_FC POSRES_FC
+13 1 POSRES_FC POSRES_FC POSRES_FC
+15 1 POSRES_FC POSRES_FC POSRES_FC
+18 1 POSRES_FC POSRES_FC POSRES_FC
+21 1 POSRES_FC POSRES_FC POSRES_FC
+23 1 POSRES_FC POSRES_FC POSRES_FC
+25 1 POSRES_FC POSRES_FC POSRES_FC
+28 1 POSRES_FC POSRES_FC POSRES_FC
+30 1 POSRES_FC POSRES_FC POSRES_FC
+32 1 POSRES_FC POSRES_FC POSRES_FC
+#endif
+
+[ bonds ]
+; Side chain bonds
+ 1  2 1 0.330 5000
+ 2  3 1 0.380 5000
+ 4  5 1 0.363 7500
+ 6  7 1 0.363 7500
+ 8  9 1 0.330 5000
+ 9 10 1 0.380 5000
+11 12 1 0.363 7500
+13 14 1 0.363 7500
+15 16 1 0.330 5000
+16 17 1 0.380 5000
+18 19 1 0.330 5000
+19 20 1 0.380 5000
+21 22 1 0.363 7500
+23 24 1 0.363 7500
+25 26 1 0.330 5000
+26 27 1 0.380 5000
+28 29 1 0.363 7500
+30 31 1 0.363 7500
+32 33 1 0.330 5000
+33 34 1 0.380 5000
+
+[ constraints ]
+; Backbone bonds
+ 1  4 1 0.33
+ 4  6 1 0.310
+ 6  8 1 0.310
+ 8 11 1 0.310
+11 13 1 0.310
+13 15 1 0.310
+15 18 1 0.310
+18 21 1 0.310
+21 23 1 0.310
+23 25 1 0.310
+25 28 1 0.310
+28 30 1 0.310
+30 32 1 0.33
+
+[ angles ]
+; BBB angles
+ 1  4  6 10 127 20
+ 4  6  8 2 96 700
+ 6  8 11 2 96 700
+ 8 11 13 2 96 700
+11 13 15 2 96 700
+13 15 18 2 96 700
+15 18 21 2 96 700
+18 21 23 2 96 700
+21 23 25 2 96 700
+23 25 28 2 96 700
+25 28 30 2 96 700
+28 30 32 10 127 20
+
+; BBS angles regular martini
+ 1  4  5 2 100 25
+ 4  6  7 2 100 25
+ 6  8  9 2 100 25
+ 8 11 12 2 100 25
+11 13 14 2 100 25
+13 15 16 2 100 25
+15 18 19 2 100 25
+18 21 22 2 100 25
+21 23 24 2 100 25
+23 25 26 2 100 25
+25 28 29 2 100 25
+28 30 31 2 100 25
+30 32 33 2 100 25
+
+; First SBB regular martini
+ 2  1  4 2 100 25
+
+; SC-BB-BB and BB-BB-SC scFix
+ 2  1  4 10 100 15 ; SC-BB-BB
+ 5  4  6 10 100 15 ; SC-BB-BB
+ 7  6  8 10 100 15 ; SC-BB-BB
+ 9  8 11 10 100 15 ; SC-BB-BB
+12 11 13 10 100 15 ; SC-BB-BB
+14 13 15 10 100 15 ; SC-BB-BB
+16 15 18 10 100 15 ; SC-BB-BB
+19 18 21 10 100 15 ; SC-BB-BB
+22 21 23 10 100 15 ; SC-BB-BB
+24 23 25 10 100 15 ; SC-BB-BB
+26 25 28 10 100 15 ; SC-BB-BB
+29 28 30 10 100 15 ; SC-BB-BB
+31 30 32 10 100 15 ; SC-BB-BB
+ 1  4  5 10 100 15 ; BB-BB-SC
+ 4  6  7 10 100 15 ; BB-BB-SC
+ 6  8  9 10 100 15 ; BB-BB-SC
+ 8 11 12 10 100 15 ; BB-BB-SC
+11 13 14 10 100 15 ; BB-BB-SC
+13 15 16 10 100 15 ; BB-BB-SC
+15 18 19 10 100 15 ; BB-BB-SC
+18 21 22 10 100 15 ; BB-BB-SC
+21 23 24 10 100 15 ; BB-BB-SC
+23 25 26 10 100 15 ; BB-BB-SC
+25 28 29 10 100 15 ; BB-BB-SC
+28 30 31 10 100 15 ; BB-BB-SC
+30 32 33 10 100 15 ; BB-BB-SC
+
+; Side chain angles
+ 1  2  3 2 180.000 25.0
+ 8  9 10 2 180.000 25.0
+15 16 17 2 180.000 25.0
+18 19 20 2 180.000 25.0
+25 26 27 2 180.000 25.0
+32 33 34 2 180.000 25.0
+
+[ dihedrals ]
+ 4  6  8 11 1 -120 400 1
+ 6  8 11 13 1 -120 400 1
+ 8 11 13 15 1 -120 400 1
+11 13 15 18 1 -120 400 1
+13 15 18 21 1 -120 400 1
+15 18 21 23 1 -120 400 1
+18 21 23 25 1 -120 400 1
+21 23 25 28 1 -120 400 1
+23 25 28 30 1 -120 400 1
+
+; SC-BB-BB-SC scFix
+ 2  1  4  5 1 -130.8 75 1 ; SC-BB-BB-SC
+ 5  4  6  7 1 -137.3 75 1 ; SC-BB-BB-SC
+ 7  6  8  9 1 -120.6 75 1 ; SC-BB-BB-SC
+ 9  8 11 12 1 -146.3 75 1 ; SC-BB-BB-SC
+12 11 13 14 1 -146.0 75 1 ; SC-BB-BB-SC
+14 13 15 16 1 -130.6 75 1 ; SC-BB-BB-SC
+16 15 18 19 1 -130.2 75 1 ; SC-BB-BB-SC
+19 18 21 22 1 -148.2 75 1 ; SC-BB-BB-SC
+22 21 23 24 1 -138.6 75 1 ; SC-BB-BB-SC
+24 23 25 26 1 -116.7 75 1 ; SC-BB-BB-SC
+26 25 28 29 1 -128.9 75 1 ; SC-BB-BB-SC
+29 28 30 31 1 -151.5 75 1 ; SC-BB-BB-SC
+31 30 32 33 1 -156.9 75 1 ; SC-BB-BB-SC
+

@@ -137,8 +137,8 @@ def run_martinize_docker(run_dir, pdb_path, config):
     print("Running Martinize via Docker...")
     print(f"{'='*50}")
     
-    # Extract configuration
-    cg_config = config.get('coarse_graining', {})
+    # Extract configuration (merge top-level and pmf.coarse_graining)
+    cg_config = _merge_cg_config(config)
     c_terminal = cg_config.get('c_terminal', 'NH2-ter')
     # Force-field selection (adaptive for short/aromatic peptides)
     def _read_fasta(fa_path: Path):
@@ -253,6 +253,7 @@ def _pdb_read_coords(pdb_file):
     """
     recs = []
     try:
+        raw = []
         with open(pdb_file, 'r') as f:
             for line in f:
                 if not (line.startswith('ATOM') or line.startswith('HETATM')):
@@ -260,12 +261,21 @@ def _pdb_read_coords(pdb_file):
                 try:
                     resid = int(line[22:26])
                     atom = line[12:16].strip()
-                    x = float(line[30:38]) / 10.0
-                    y = float(line[38:46]) / 10.0
-                    z = float(line[46:54]) / 10.0
-                    recs.append((resid, atom, np.array([x,y,z], dtype=float)))
+                    x = float(line[30:38])
+                    y = float(line[38:46])
+                    z = float(line[46:54])
+                    raw.append((resid, atom, x, y, z))
                 except Exception:
                     continue
+        if raw:
+            arr = np.array([[x,y,z] for (_r,_a,x,y,z) in raw], dtype=float)
+            try:
+                span = float((arr.max(axis=0) - arr.min(axis=0)).max())
+            except Exception:
+                span = 0.0
+            scale = 0.1 if span > 20.0 else 1.0
+            for resid, atom, x, y, z in raw:
+                recs.append((resid, atom, np.array([x*scale, y*scale, z*scale], dtype=float)))
     except Exception:
         pass
     return recs
@@ -277,19 +287,107 @@ def _rg(coords):
     com = arr.mean(axis=0)
     return float(np.sqrt(((arr - com)**2).sum(axis=1).mean()))
 
-def _clash_fraction(coords, cutoff_nm=0.38):
+def _clash_fraction(coords, cutoff_nm=0.38, exclude_pairs=None):
+    """Clash fraction among non-excluded pairs.
+
+    exclude_pairs: optional set of (i,j) index pairs (0-based, i<j) to skip (e.g., 1–2/1–3/1–4 neighbors).
+    """
     n = len(coords)
     if n < 2:
         return 0.0
     arr = np.vstack(coords)
     clashes = 0
     total = 0
-    for i in range(n-1):
-        for j in range(i+1, n):
+    excl = exclude_pairs or set()
+    for i in range(n - 1):
+        for j in range(i + 1, n):
+            if (i, j) in excl:
+                continue
             total += 1
-            if np.linalg.norm(arr[i]-arr[j]) < float(cutoff_nm):
+            if np.linalg.norm(arr[i] - arr[j]) < float(cutoff_nm):
                 clashes += 1
-    return float(clashes/total) if total else 0.0
+    return float(clashes / total) if total else 0.0
+
+def _parse_itp_atoms_bonds(itp_path: Path):
+    """Parse [ atoms ] and [ bonds ] from an ITP file.
+
+    Returns (atoms, bonds) where atoms=[(id,resnr,atomname)], bonds=[(i,j)] 1-based.
+    """
+    atoms = []
+    bonds = []
+    in_atoms = False
+    in_bonds = False
+    try:
+        with open(itp_path, 'r') as f:
+            for line in f:
+                s = line.split(';', 1)[0].strip()
+                if not s:
+                    continue
+                if s.startswith('['):
+                    tag = s.lower()
+                    in_atoms = ('[ atoms' in tag)
+                    in_bonds = ('[ bonds' in tag)
+                    continue
+                if in_atoms:
+                    cols = s.split()
+                    if len(cols) >= 6 and cols[0].isdigit():
+                        try:
+                            atoms.append((int(cols[0]), int(cols[2]), cols[4]))
+                        except Exception:
+                            pass
+                elif in_bonds:
+                    cols = s.split()
+                    if len(cols) >= 2 and cols[0].isdigit() and cols[1].isdigit():
+                        try:
+                            bonds.append((int(cols[0]), int(cols[1])))
+                        except Exception:
+                            pass
+    except Exception:
+        pass
+    return atoms, bonds
+
+def _exclusion_pairs_up_to_14(n_atoms: int, bonds):
+    """Generate (i,j) pairs (0-based, i<j) to exclude up to 1-4 neighbors using bond graph."""
+    adj = [set() for _ in range(n_atoms)]
+    for i, j in bonds:
+        i -= 1; j -= 1
+        if 0 <= i < n_atoms and 0 <= j < n_atoms:
+            adj[i].add(j); adj[j].add(i)
+    excl = set()
+    for i in range(n_atoms):
+        # 1-2 neighbors
+        for j in adj[i]:
+            a, b = (i, j) if i < j else (j, i)
+            excl.add((a, b))
+            # 1-3 neighbors
+            for k in adj[j]:
+                if k == i:
+                    continue
+                a, b = (i, k) if i < k else (k, i)
+                excl.add((a, b))
+                # 1-4 neighbors
+                for m in adj[k]:
+                    if m == i or m == j:
+                        continue
+                    a, b = (i, m) if i < m else (m, i)
+                    excl.add((a, b))
+    return excl
+
+def _map_itp_order_to_pdb_indices(itp_atoms, cg_recs):
+    """Map ITP atom order to indices in cg_recs (0-based) using (resnr, atomname)."""
+    from collections import defaultdict
+    hits = defaultdict(list)
+    for idx, (resid, atom, _xyz) in enumerate(cg_recs):
+        hits[(resid, atom)].append(idx)
+    idx_map = []
+    for (_aid, resnr, atomname) in itp_atoms:
+        key = (resnr, atomname)
+        lst = hits.get(key)
+        if lst:
+            idx_map.append(lst.pop(0))
+        else:
+            idx_map.append(None)
+    return idx_map
 
 def _backbone_distances_cg(cg_recs):
     bb = [(res, xyz) for (res, atom, xyz) in cg_recs if atom.upper() == 'BB']
@@ -342,11 +440,44 @@ def validate_cg_structure(run_dir, peptide_id, pdb_path, config=None):
     aa_recs = _pdb_read_coords(str(pdb_path))
     cg_coords = [xyz for (_r, _a, xyz) in cg_recs]
     aa_coords = [xyz for (_r, _a, xyz) in aa_recs]
-    # Clash fraction
-    cf = _clash_fraction(cg_coords, cutoff_nm=thr['clash_cutoff_nm'])
+    # Build exclusion pairs from ITP topology (exclude 1–2/1–3/1–4 neighbors)
+    itp_path = Path(run_dir) / 'coarse_grain' / f"{peptide_id}.itp"
+    itp_atoms, itp_bonds = _parse_itp_atoms_bonds(itp_path)
+    excl_pairs = set()
+    if itp_atoms and itp_bonds:
+        idx_map = _map_itp_order_to_pdb_indices(itp_atoms, cg_recs)
+        excl_itp = _exclusion_pairs_up_to_14(len(idx_map), itp_bonds)
+        for i, j in excl_itp:
+            ip = idx_map[i]; jp = idx_map[j]
+            if ip is not None and jp is not None:
+                a, b = (ip, jp) if ip < jp else (jp, ip)
+                excl_pairs.add((a, b))
+    # Clash fraction with exclusions
+    cf = _clash_fraction(cg_coords, cutoff_nm=thr['clash_cutoff_nm'], exclude_pairs=excl_pairs)
     report['metrics']['clash_fraction'] = float(cf)
     if cf > thr['clash_frac_max']:
         report['passed'] = False
+        # Optional diagnostics: print worst clashes
+        try:
+            if cg_coords:
+                arr = np.vstack(cg_coords)
+                worst = []
+                for i in range(len(arr) - 1):
+                    for j in range(i + 1, len(arr)):
+                        if (i, j) in excl_pairs:
+                            continue
+                        d = float(np.linalg.norm(arr[i] - arr[j]))
+                        if d < thr['clash_cutoff_nm']:
+                            worst.append((d, i, j))
+                worst.sort()
+                if worst:
+                    print("  Worst clashes (nm):")
+                    for d, i, j in worst[:10]:
+                        ri, ai, _ = cg_recs[i]
+                        rj, aj, _ = cg_recs[j]
+                        print(f"    {d:.3f}  (i={i}:{ri}:{ai} , j={j}:{rj}:{aj})")
+        except Exception:
+            pass
     # BB distances
     bb_d = _backbone_distances_cg(cg_recs)
     if bb_d:

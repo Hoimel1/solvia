@@ -10,6 +10,8 @@ import yaml
 import argparse
 import subprocess
 import logging
+import math
+from copy import deepcopy
 from pathlib import Path
 
 def setup_logging(level=logging.INFO):
@@ -51,8 +53,8 @@ def load_config(config_file=None):
     
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
-        
-    # Add missing default values
+
+    # Add missing default values (non-mutating)
     config = add_config_defaults(config)
     logging.info(f"Loaded configuration from: {config_path}")
     return config
@@ -102,20 +104,80 @@ def get_default_config():
         }
     }
 
-def add_config_defaults(config):
-    """Add default values for missing configuration keys"""
+def deep_merge(defaults: dict, overrides: dict | None) -> dict:
+    """Return a deep-merged copy of defaults overlaid by overrides."""
+    result = deepcopy(defaults)
+    def rec(dst, src):
+        for k, v in (src or {}).items():
+            if isinstance(v, dict) and isinstance(dst.get(k), dict):
+                rec(dst[k], v)
+            else:
+                dst[k] = v
+    rec(result, overrides or {})
+    return result
+
+
+def add_config_defaults(config: dict | None) -> dict:
+    """Return merged config (defaults + overrides) without mutating input."""
     defaults = get_default_config()
-    
-    # Deep merge defaults
-    def merge_dict(base, updates):
-        for key, value in updates.items():
-            if key in base and isinstance(base[key], dict) and isinstance(value, dict):
-                merge_dict(base[key], value)
-            elif key not in base:
-                base[key] = value
-    
-    merge_dict(config, defaults)
-    return config
+    return deep_merge(defaults, config or {})
+
+
+def validate_and_normalize_config(cfg: dict) -> dict:
+    """Validate basic simulation parameters and normalize types.
+
+    Raises ValueError on invalid inputs. Returns cfg with a validation flag.
+    """
+    sim = cfg.get('simulation', {}) or {}
+    # required positive floats
+    for key in ('temperature', 'pressure', 'timestep'):
+        try:
+            v = float(sim.get(key, 0))
+        except Exception:
+            raise ValueError(f"simulation.{key} must be a float")
+        if not (v > 0):
+            raise ValueError(f"simulation.{key} must be > 0")
+    # times (ps)
+    for phase in ('nvt', 'npt'):
+        try:
+            t = float(sim.get(phase, {}).get('time', 0.0))
+        except Exception:
+            raise ValueError(f"simulation.{phase}.time must be a float")
+        if not (t > 0):
+            raise ValueError(f"simulation.{phase}.time must be > 0 ps")
+    # tau_p
+    try:
+        tau_p = float(sim.get('npt', {}).get('tau_p', 0.0))
+    except Exception:
+        raise ValueError("simulation.npt.tau_p must be a float")
+    if tau_p <= 0:
+        raise ValueError("simulation.npt.tau_p must be > 0")
+    # compressibility
+    try:
+        float(sim.get('npt', {}).get('compressibility', 4.5e-5))
+    except Exception:
+        raise ValueError("simulation.npt.compressibility must be float")
+
+    cfg['__validated__'] = True
+    return cfg
+
+
+def _nsteps(time_ps: float, dt_ps: float) -> int:
+    """Robust integer step count avoiding FP off-by-one via floor with epsilon."""
+    return int(math.floor((float(time_ps) / float(dt_ps)) + 1e-9))
+
+
+def _docker_available(project_root: Path) -> bool:
+    """Return True if docker compose is available and compose file exists."""
+    try:
+        r = subprocess.run(["docker", "compose", "version"], capture_output=True, text=True)
+        return r.returncode == 0 and (project_root / "docker-compose.yml").exists()
+    except Exception:
+        return False
+
+
+class EquilibrationError(RuntimeError):
+    pass
 
 def load_run_metadata(run_dir):
     """Load run metadata"""
@@ -127,7 +189,17 @@ def create_mdp_files(run_dir, config):
     """Create MDP files for equilibration"""
     mdp_dir = os.path.join(run_dir, "equilibration", "mdp")
     os.makedirs(mdp_dir, exist_ok=True)
-    
+
+    # Normalized locals for templating (avoid FP artifacts and injection)
+    sim = config.get('simulation', {})
+    dt = float(sim.get('timestep', 0.02))
+    temp = float(sim.get('temperature', 310.0))
+    press = float(sim.get('pressure', 1.0))
+    nvt_steps = _nsteps(float(sim.get('nvt', {}).get('time', 2000.0)), dt)
+    npt_steps = _nsteps(float(sim.get('npt', {}).get('time', 20000.0)), dt)
+    tau_p_glob = float(sim.get('npt', {}).get('tau_p', 12.0))
+    comp_glob = float(sim.get('npt', {}).get('compressibility', 4.5e-5))
+
     def posres_define(phase: str) -> str:
         pol = (
             config.get('simulation', {})
@@ -137,22 +209,27 @@ def create_mdp_files(run_dir, config):
         pol = str(pol).strip().lower()
         if pol in ('off', 'none', 'false', '0', 'no'):
             return '; Position restraints: off\n'
-        # weak/strong both rely on POSRES macro here; strength is controlled in topology/itp
+        if pol in ('weak', 'soft'):
+            return 'define                  = -DPOSRES_WEAK\n'
+        # default strong
         return 'define                  = -DPOSRES\n'
 
     def thermostat_block(phase: str) -> str:
-        sim = config.get('simulation', {})
-        tcfg = (sim.get('thermostat') or {})
-        alg = tcfg.get('algorithm', 'v-rescale')
+        sim_local = config.get('simulation', {})
+        tcfg = (sim_local.get('thermostat') or {})
+        alg = str(tcfg.get('algorithm', 'v-rescale')).strip().lower()
+        allowed_algos = {'v-rescale', 'nose-hoover'}
+        if alg not in allowed_algos:
+            logging.warning(f"Unsupported thermostat algorithm '{alg}', falling back to v-rescale")
+            alg = 'v-rescale'
         groups = tcfg.get('tc_grps', 'System')
-        temp = float(sim.get('temperature', 310))
         if isinstance(groups, (list, tuple)):
             groups = ' '.join(map(str, groups))
         group_list = groups.split()
         ngrp = max(1, len(group_list))
         tau_cfg = tcfg.get('tau_t', None)
         if tau_cfg is None:
-            base_tau = float(sim.get(phase, {}).get('tau_t', 1.0))
+            base_tau = float(sim_local.get(phase, {}).get('tau_t', 1.0))
             tau_str = ' '.join([f"{base_tau}"] * ngrp)
         else:
             if isinstance(tau_cfg, (list, tuple)):
@@ -172,9 +249,10 @@ tc-grps                = {groups}
 tau-t                  = {tau_str}
 ref-t                  = {ref_str}
 """
-    
+
     # Energy minimization MDP
     em_mdp = f"""; Energy minimization for Martini 3 membrane-peptide system
+; epsilon_r=15, rcoulomb=1.1, rvdw=1.1 are Martini 3 recommendations.
 integrator              = steep
 emtol                   = {config['simulation']['em']['emtol']}
 emstep                  = 0.01
@@ -188,7 +266,7 @@ nstlist                 = 20
 pbc                     = xyz
 verlet-buffer-tolerance = 0.005
 
-; Electrostatics and VdW (study reference)
+; Electrostatics and VdW (Martini 3 standard)
 coulombtype             = reaction-field
 rcoulomb                = 1.1
 epsilon_r               = 15
@@ -205,12 +283,13 @@ pcoupl                  = no
 constraints             = none
 constraint-algorithm    = lincs
 """
-    
+
     # NVT equilibration MDP
     nvt_mdp = f"""; NVT equilibration for Martini 3 membrane-peptide system
+; epsilon_r=15, rcoulomb=1.1, rvdw=1.1 are Martini 3 recommendations.
 integrator              = md
-dt                      = {config['simulation']['timestep']}
-nsteps                  = {int(config['simulation']['nvt']['time'] / config['simulation']['timestep'])}
+dt                      = {dt}
+nsteps                  = {nvt_steps}
 nstcomm                 = 100
 
 ; Position restraints on peptides
@@ -231,7 +310,7 @@ nstlist                 = 20
 pbc                     = xyz
 verlet-buffer-tolerance = 0.005
 
-; Electrostatics and VdW (study reference)
+; Electrostatics and VdW (Martini 3 standard)
 coulombtype             = reaction-field
 rcoulomb                = 1.1
 epsilon_r               = 15
@@ -248,19 +327,20 @@ pcoupl                  = no
 
 ; Generate velocities
 gen-vel                 = yes
-gen-temp                = {config['simulation']['temperature']}
+gen-temp                = {temp}
 gen-seed                = -1
 
 ; Constraints
 constraints             = none
 constraint-algorithm    = lincs
 """
-    
-    # NPT equilibration MDP  
+
+    # NPT equilibration MDP
     npt_mdp = f"""; NPT equilibration for Martini 3 membrane-peptide system
+; epsilon_r=15, rcoulomb=1.1, rvdw=1.1 are Martini 3 recommendations.
 integrator              = md
-dt                      = {config['simulation']['timestep']}
-nsteps                  = {int(config['simulation']['npt']['time'] / config['simulation']['timestep'])}
+dt                      = {dt}
+nsteps                  = {npt_steps}
 nstcomm                 = 100
 
 ; Position restraints on peptides (can be removed or weakened)
@@ -281,7 +361,7 @@ nstlist                 = 20
 pbc                     = xyz
 verlet-buffer-tolerance = 0.005
 
-; Electrostatics and VdW (study reference)
+; Electrostatics and VdW (Martini 3 standard)
 coulombtype             = reaction-field
 rcoulomb                = 1.1
 epsilon_r               = 15
@@ -293,12 +373,12 @@ cutoff-scheme           = Verlet
 ; Temperature coupling
 {thermostat_block('npt')}
 
-; Pressure coupling (study reference)
+; Pressure coupling (semiisotropic)
 pcoupl                  = Parrinello-Rahman
 pcoupltype              = semiisotropic
-tau-p                   = {config['simulation']['npt']['tau_p']}
-ref-p                   = {config['simulation']['pressure']} {config['simulation']['pressure']}
-compressibility         = {config['simulation']['npt']['compressibility']} 0
+tau-p                   = {tau_p_glob}
+ref-p                   = {press} {press}
+compressibility         = {comp_glob} 0
 
 ; No velocity generation
 gen-vel                 = no
@@ -310,7 +390,7 @@ constraint-algorithm    = lincs
     # Also prepare multistage NPT (Berendsen -> Parrinello-Rahman)
     sim = config.get('simulation', {})
     dt = float(sim.get('timestep', 0.02))
-    total_steps = int(sim.get('npt', {}).get('time', 20000.0) / dt)
+    total_steps = _nsteps(float(sim.get('npt', {}).get('time', 20000.0)), dt)
     ms = sim.get('npt_multistage', {}) or {}
     ms_enabled = bool(ms.get('enabled', True))
     frac = float(ms.get('initial_fraction', 0.3))
@@ -320,6 +400,7 @@ constraint-algorithm    = lincs
     tau_p_pr = float(sim.get('npt', {}).get('tau_p', 12.0))
     comp = sim.get('npt', {}).get('compressibility', 4.5e-5)
     press = sim.get('pressure', 1.0)
+    logging.info(f"NPT multistage: total={total_steps} steps; berendsen={steps_ber}; pr={steps_pr} (frac={frac:.2f})")
 
     npt_ber_mdp = f"""; NPT initial (Berendsen)
 integrator              = md
@@ -440,40 +521,53 @@ constraint-algorithm    = lincs
 
 def run_grompp(mdp_file, coord_file, top_file, output_tpr, 
                ref_file=None, cpt_file=None, maxwarn=2):
-    """Run GROMACS grompp via Docker"""
-    from pathlib import Path
-    
+    """Run GROMACS grompp via Docker (preferred) or host fallback."""
     # Get relative paths from project root
     project_root = Path(__file__).parent.parent.parent
     rel_mdp = os.path.relpath(mdp_file, project_root)
     rel_coord = os.path.relpath(coord_file, project_root)
     rel_top = os.path.relpath(top_file, project_root)
     rel_tpr = os.path.relpath(output_tpr, project_root)
-    
-    # Build Docker command (gromacs container has ENTRYPOINT ["gmx"])
-    cmd = [
-        "docker", "compose", "run", "--rm", "gromacs",
-        "grompp",  # Just the subcommand - Docker already provides "gmx"
-        "-f", f"/work/{rel_mdp}",
-        "-c", f"/work/{rel_coord}",
-        "-p", f"/work/{rel_top}",
-        "-o", f"/work/{rel_tpr}",
-        "-maxwarn", str(maxwarn)
-    ]
-    # Add include paths so local and centralized ITPs resolve cleanly
-    # Always include force_fields and the run's coarse_grain directory
-    # Note: GROMACS 2023.5 does not support -I on grompp. We rely on absolute
-    # include paths in generated .top files instead.
-    
-    if ref_file:
-        rel_ref = os.path.relpath(ref_file, project_root)
-        cmd.extend(["-r", f"/work/{rel_ref}"])
-    if cpt_file and os.path.exists(cpt_file):
-        rel_cpt = os.path.relpath(cpt_file, project_root)
-        cmd.extend(["-t", f"/work/{rel_cpt}"])
-    
-    # Run from project root (where docker-compose.yml is)
-    result = subprocess.run(cmd, capture_output=True, text=True, cwd=str(project_root))
+    # Container working dir: place emergency files (e.g., step*.pdb) in target folder
+    out_dir = os.path.dirname(output_tpr)
+    rel_out_dir = os.path.relpath(out_dir, project_root)
+
+    use_docker = _docker_available(project_root) and (os.environ.get("USE_DOCKER", "1") != "0")
+
+    if use_docker:
+        # gromacs container has ENTRYPOINT ["gmx"]. We call subcommand only.
+        cmd = [
+            "docker", "compose", "run", "--rm", "--workdir", f"/work/{rel_out_dir}", "gromacs",
+            "grompp",
+            "-f", f"/work/{rel_mdp}",
+            "-c", f"/work/{rel_coord}",
+            "-p", f"/work/{rel_top}",
+            "-o", f"/work/{rel_tpr}",
+            "-maxwarn", str(maxwarn)
+        ]
+        if ref_file:
+            rel_ref = os.path.relpath(ref_file, project_root)
+            cmd.extend(["-r", f"/work/{rel_ref}"])
+        if cpt_file and os.path.exists(cpt_file):
+            rel_cpt = os.path.relpath(cpt_file, project_root)
+            cmd.extend(["-t", f"/work/{rel_cpt}"])
+    else:
+        # Host fallback: requires gmx in PATH
+        cmd = [
+            "gmx", "grompp",
+            "-f", os.path.abspath(mdp_file),
+            "-c", os.path.abspath(coord_file),
+            "-p", os.path.abspath(top_file),
+            "-o", os.path.abspath(output_tpr),
+            "-maxwarn", str(maxwarn)
+        ]
+        if ref_file:
+            cmd.extend(["-r", os.path.abspath(ref_file)])
+        if cpt_file and os.path.exists(cpt_file):
+            cmd.extend(["-t", os.path.abspath(cpt_file)])
+
+    # Run; set cwd to out_dir so any emergency files (step*.pdb) land there
+    result = subprocess.run(cmd, capture_output=True, text=True, cwd=(str(project_root) if use_docker else out_dir or str(project_root)))
     if result.returncode != 0:
         logging.error("GROMPP failed:")
         if result.stdout:
@@ -484,31 +578,40 @@ def run_grompp(mdp_file, coord_file, top_file, output_tpr,
     return True
 
 def run_mdrun(tpr_file, output_prefix, nt=None, append_restart=False):
-    """Run GROMACS mdrun via Docker"""
-    from pathlib import Path
-    
+    """Run GROMACS mdrun via Docker (preferred) or host fallback."""
     # Get relative paths from project root
     project_root = Path(__file__).parent.parent.parent
     rel_tpr = os.path.relpath(tpr_file, project_root)
     rel_prefix = os.path.relpath(output_prefix, project_root)
-    
-    # Build Docker command (gromacs container has ENTRYPOINT ["gmx"])
-    cmd = [
-        "docker", "compose", "run", "--rm", "gromacs",
-        "mdrun",  # Just the subcommand - Docker already provides "gmx"
-        "-v",
-        "-deffnm", f"/work/{rel_prefix}"
-    ]
-    
+    # Container working dir: parent of output_prefix
+    out_dir = os.path.dirname(output_prefix)
+    rel_out_dir = os.path.relpath(out_dir, project_root)
+
+    use_docker = _docker_available(project_root) and (os.environ.get("USE_DOCKER", "1") != "0")
+
+    if use_docker:
+        cmd = [
+            "docker", "compose", "run", "--rm", "--workdir", f"/work/{rel_out_dir}", "gromacs",
+            "mdrun",
+            "-v",
+            "-deffnm", f"/work/{rel_prefix}"
+        ]
+    else:
+        cmd = [
+            "gmx", "mdrun",
+            "-v",
+            "-deffnm", os.path.abspath(output_prefix)
+        ]
+
     if nt:
         cmd.extend(["-nt", str(nt)])
-    
+
     if append_restart:
         cmd.append("-append")
         logging.info("Using -append flag for checkpoint restart")
-    
-    # Run from project root (where docker-compose.yml is)
-    result = subprocess.run(cmd, capture_output=True, text=True, cwd=str(project_root))
+
+    # Run; set cwd to out_dir so emergency PDBs land in the right folder
+    result = subprocess.run(cmd, capture_output=True, text=True, cwd=(str(project_root) if use_docker else out_dir or str(project_root)))
     if result.returncode != 0:
         logging.error(f"MDRUN failed:")
         if result.stdout:
@@ -519,155 +622,153 @@ def run_mdrun(tpr_file, output_prefix, nt=None, append_restart=False):
     return True
 
 def equilibrate_system(run_dir, occupancy="low", tag: str | None = None, config=None):
-    """Run complete equilibration workflow"""
+    """Run complete equilibration workflow with robust error handling."""
     logger = logging.getLogger(__name__)
-    
+
     if config is None:
         config = load_config()
+    # ensure defaults and validate
+    config = validate_and_normalize_config(add_config_defaults(config))
     metadata = load_run_metadata(run_dir)
-    
+
     # Input files (support custom tag for replicates, e.g. n1_rep1)
     use_tag = tag if tag else occupancy
     system_dir = os.path.join(run_dir, "system")
     system_gro = os.path.join(system_dir, f"system_{use_tag}.gro")
     system_top = os.path.join(system_dir, f"system_{use_tag}.top")
-    
-    # If not found, try to find any system file
-    if not os.path.exists(system_gro):
-        # Look for any system_*.gro file
-        import glob
-        system_files = glob.glob(os.path.join(system_dir, "system_*.gro"))
-        if system_files:
-            # Use the first (or most recent) system file found
-            system_gro = system_files[0]
-            basename = os.path.basename(system_gro)
-            use_tag = basename.replace("system_", "").replace(".gro", "")
-            system_top = os.path.join(system_dir, f"system_{use_tag}.top")
-            logger.info(f"Using system file: {basename}")
-        else:
-            logger.error(f"No system files found in {system_dir}")
-            logger.error("Run peptide insertion first: python 05_insert_peptides.py")
-            sys.exit(1)
-    
-    if not os.path.exists(system_gro):
-        logger.error(f"System file not found: {system_gro}")
-        sys.exit(1)
-    
-    # Create MDP files
-    mdp_dir = create_mdp_files(run_dir, config)
-    
-    # Energy minimization
-    logger.info("Starting Energy Minimization")
-    em_dir = os.path.join(run_dir, "equilibration", "em")
-    os.makedirs(em_dir, exist_ok=True)  # Ensure directory exists
-    em_mdp = os.path.join(mdp_dir, "em.mdp")
-    em_tpr = os.path.join(em_dir, "em.tpr")
-    
-    logger.info("Running GROMPP for energy minimization")
-    if not run_grompp(em_mdp, system_gro, system_top, em_tpr, ref_file=system_gro):
-        logger.error("EM grompp failed")
-        sys.exit(1)
-    
-    logger.info("Running energy minimization")
-    if not run_mdrun(em_tpr, os.path.join(em_dir, "em"), 
-                     config['performance']['cpu_threads']):
-        logger.error("Energy minimization failed")
-        sys.exit(1)
-    
-    # Check EM results
-    em_gro = os.path.join(em_dir, "em.gro")
-    if os.path.exists(em_gro):
-        logger.info("✓ Energy minimization completed successfully")
-    else:
-        logger.error("✗ Energy minimization output not found")
-        sys.exit(1)
-    
-    # NVT equilibration
-    logger.info("Starting NVT Equilibration")
-    nvt_dir = os.path.join(run_dir, "equilibration", "nvt")
-    os.makedirs(nvt_dir, exist_ok=True)  # Ensure directory exists
-    nvt_mdp = os.path.join(mdp_dir, "nvt.mdp")
-    nvt_tpr = os.path.join(nvt_dir, "nvt.tpr")
-    
-    logger.info("Running GROMPP for NVT equilibration")
-    if not run_grompp(nvt_mdp, em_gro, system_top, nvt_tpr, ref_file=em_gro):
-        logger.error("NVT grompp failed")
-        sys.exit(1)
-    
-    logger.info(f"Running NVT equilibration ({config['simulation']['nvt']['time']} ps)")
-    if not run_mdrun(nvt_tpr, os.path.join(nvt_dir, "nvt"),
-                     config['performance']['cpu_threads']):
-        logger.error("NVT equilibration failed")
-        sys.exit(1)
-    
-    nvt_gro = os.path.join(nvt_dir, "nvt.gro")
-    nvt_cpt = os.path.join(nvt_dir, "nvt.cpt")
-    if os.path.exists(nvt_gro):
-        logger.info("✓ NVT equilibration completed successfully")
-    else:
-        logger.error("✗ NVT equilibration output not found")
-        sys.exit(1)
-    
-    # NPT equilibration (multistage Berendsen -> Parrinello-Rahman)
-    logger.info("Starting NPT Equilibration (multistage)")
-    # Stage 1: Berendsen
-    npt1_dir = os.path.join(run_dir, "equilibration", "npt_ber")
-    os.makedirs(npt1_dir, exist_ok=True)
-    npt1_mdp = os.path.join(mdp_dir, "npt_ber.mdp")
-    npt1_tpr = os.path.join(npt1_dir, "npt_ber.tpr")
-    logger.info("Running GROMPP for NPT (Berendsen)")
-    if not run_grompp(npt1_mdp, nvt_gro, system_top, npt1_tpr, ref_file=nvt_gro, cpt_file=nvt_cpt):
-        logger.error("NPT (Berendsen) grompp failed")
-        sys.exit(1)
-    logger.info("Running NPT (Berendsen) stage")
-    if not run_mdrun(npt1_tpr, os.path.join(npt1_dir, "npt_ber"), config['performance']['cpu_threads']):
-        logger.error("NPT (Berendsen) failed")
-        sys.exit(1)
-    npt1_gro = os.path.join(npt1_dir, "npt_ber.gro")
-    npt1_cpt = os.path.join(npt1_dir, "npt_ber.cpt")
-    if os.path.exists(npt1_gro):
-        logger.info("✓ NPT (Berendsen) completed successfully")
-    else:
-        logger.error("✗ NPT (Berendsen) output not found")
-        sys.exit(1)
 
-    # Stage 2: Parrinello-Rahman
-    npt2_dir = os.path.join(run_dir, "equilibration", "npt_pr")
-    os.makedirs(npt2_dir, exist_ok=True)
-    npt2_mdp = os.path.join(mdp_dir, "npt_pr.mdp")
-    npt2_tpr = os.path.join(npt2_dir, "npt_pr.tpr")
-    logger.info("Running GROMPP for NPT (Parrinello-Rahman)")
-    if not run_grompp(npt2_mdp, npt1_gro, system_top, npt2_tpr, ref_file=npt1_gro, cpt_file=npt1_cpt):
-        logger.error("NPT (Parrinello-Rahman) grompp failed")
-        sys.exit(1)
-    logger.info("Running NPT (Parrinello-Rahman) stage")
-    if not run_mdrun(npt2_tpr, os.path.join(npt2_dir, "npt_pr"), config['performance']['cpu_threads']):
-        logger.error("NPT (Parrinello-Rahman) failed")
-        sys.exit(1)
-    npt2_gro = os.path.join(npt2_dir, "npt_pr.gro")
-    if os.path.exists(npt2_gro):
-        logger.info("✓ NPT (Parrinello-Rahman) completed successfully")
-    else:
-        logger.error("✗ NPT (Parrinello-Rahman) output not found")
-        sys.exit(1)
-    
-    logger.info(f"\u2713 Equilibration complete for {metadata['peptide_id']} ({use_tag})")
-    
-    # Save equilibration summary
+    # Track progress for summary writing
     summary = {
-        'peptide_id': metadata['peptide_id'],
+        'peptide_id': metadata.get('peptide_id'),
         'tag': use_tag,
-        'em_completed': os.path.exists(em_gro),
-        'nvt_completed': os.path.exists(nvt_gro),
-        'npt_completed': os.path.exists(npt2_gro),
-        'final_structure': 'equilibration/npt_pr/npt_pr.gro',
-        'final_checkpoint': 'equilibration/npt_pr/npt_pr.cpt'
+        'em_completed': False,
+        'nvt_completed': False,
+        'npt_completed': False,
+        'final_structure': None,
+        'final_checkpoint': None,
     }
-    
-    with open(os.path.join(run_dir, "equilibration", "summary.yaml"), 'w') as f:
-        yaml.dump(summary, f, default_flow_style=False)
-    
-    return npt2_gro
+
+    try:
+        # If not found, try to find newest system_*.gro file
+        if not os.path.exists(system_gro):
+            import glob
+            system_files = glob.glob(os.path.join(system_dir, "system_*.gro"))
+            if system_files:
+                system_files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+                system_gro = system_files[0]
+                basename = os.path.basename(system_gro)
+                use_tag = basename.replace("system_", "").replace(".gro", "")
+                system_top = os.path.join(system_dir, f"system_{use_tag}.top")
+                summary['tag'] = use_tag
+                logger.info(f"Using system file: {basename}")
+            else:
+                raise EquilibrationError(f"No system files found in {system_dir}. Run peptide insertion first.")
+
+        if not os.path.exists(system_gro):
+            raise EquilibrationError(f"System file not found: {system_gro}")
+
+        # Create MDP files
+        mdp_dir = create_mdp_files(run_dir, config)
+
+        # Energy minimization
+        logger.info("Starting Energy Minimization")
+        em_dir = os.path.join(run_dir, "equilibration", "em")
+        os.makedirs(em_dir, exist_ok=True)
+        em_mdp = os.path.join(mdp_dir, "em.mdp")
+        em_tpr = os.path.join(em_dir, "em.tpr")
+
+        logger.info("Running GROMPP for energy minimization")
+        if not run_grompp(em_mdp, system_gro, system_top, em_tpr, ref_file=system_gro):
+            raise EquilibrationError("EM grompp failed")
+
+        logger.info("Running energy minimization")
+        if not run_mdrun(em_tpr, os.path.join(em_dir, "em"), config['performance']['cpu_threads']):
+            raise EquilibrationError("Energy minimization failed")
+
+        # Check EM results
+        em_gro = os.path.join(em_dir, "em.gro")
+        if os.path.exists(em_gro):
+            logger.info("✓ Energy minimization completed successfully")
+            summary['em_completed'] = True
+        else:
+            raise EquilibrationError("Energy minimization output not found")
+
+        # NVT equilibration
+        logger.info("Starting NVT Equilibration")
+        nvt_dir = os.path.join(run_dir, "equilibration", "nvt")
+        os.makedirs(nvt_dir, exist_ok=True)
+        nvt_mdp = os.path.join(mdp_dir, "nvt.mdp")
+        nvt_tpr = os.path.join(nvt_dir, "nvt.tpr")
+
+        logger.info("Running GROMPP for NVT equilibration")
+        if not run_grompp(nvt_mdp, em_gro, system_top, nvt_tpr, ref_file=em_gro):
+            raise EquilibrationError("NVT grompp failed")
+
+        logger.info(f"Running NVT equilibration ({config['simulation']['nvt']['time']} ps)")
+        if not run_mdrun(nvt_tpr, os.path.join(nvt_dir, "nvt"), config['performance']['cpu_threads']):
+            raise EquilibrationError("NVT equilibration failed")
+
+        nvt_gro = os.path.join(nvt_dir, "nvt.gro")
+        nvt_cpt = os.path.join(nvt_dir, "nvt.cpt")
+        if os.path.exists(nvt_gro):
+            logger.info("✓ NVT equilibration completed successfully")
+            summary['nvt_completed'] = True
+        else:
+            raise EquilibrationError("NVT equilibration output not found")
+
+        # NPT equilibration (multistage Berendsen -> Parrinello-Rahman)
+        logger.info("Starting NPT Equilibration (multistage)")
+        # Stage 1: Berendsen
+        npt1_dir = os.path.join(run_dir, "equilibration", "npt_ber")
+        os.makedirs(npt1_dir, exist_ok=True)
+        npt1_mdp = os.path.join(mdp_dir, "npt_ber.mdp")
+        npt1_tpr = os.path.join(npt1_dir, "npt_ber.tpr")
+        logger.info("Running GROMPP for NPT (Berendsen)")
+        if not run_grompp(npt1_mdp, nvt_gro, system_top, npt1_tpr, ref_file=nvt_gro, cpt_file=nvt_cpt):
+            raise EquilibrationError("NPT (Berendsen) grompp failed")
+        logger.info("Running NPT (Berendsen) stage")
+        if not run_mdrun(npt1_tpr, os.path.join(npt1_dir, "npt_ber"), config['performance']['cpu_threads']):
+            raise EquilibrationError("NPT (Berendsen) failed")
+        npt1_gro = os.path.join(npt1_dir, "npt_ber.gro")
+        npt1_cpt = os.path.join(npt1_dir, "npt_ber.cpt")
+        if os.path.exists(npt1_gro):
+            logger.info("✓ NPT (Berendsen) completed successfully")
+        else:
+            raise EquilibrationError("NPT (Berendsen) output not found")
+
+        # Stage 2: Parrinello-Rahman
+        npt2_dir = os.path.join(run_dir, "equilibration", "npt_pr")
+        os.makedirs(npt2_dir, exist_ok=True)
+        npt2_mdp = os.path.join(mdp_dir, "npt_pr.mdp")
+        npt2_tpr = os.path.join(npt2_dir, "npt_pr.tpr")
+        logger.info("Running GROMPP for NPT (Parrinello-Rahman)")
+        if not run_grompp(npt2_mdp, npt1_gro, system_top, npt2_tpr, ref_file=npt1_gro, cpt_file=npt1_cpt):
+            raise EquilibrationError("NPT (Parrinello-Rahman) grompp failed")
+        logger.info("Running NPT (Parrinello-Rahman) stage")
+        if not run_mdrun(npt2_tpr, os.path.join(npt2_dir, "npt_pr"), config['performance']['cpu_threads']):
+            raise EquilibrationError("NPT (Parrinello-Rahman) failed")
+        npt2_gro = os.path.join(npt2_dir, "npt_pr.gro")
+        npt2_cpt = os.path.join(npt2_dir, "npt_pr.cpt")
+        if os.path.exists(npt2_gro):
+            logger.info("✓ NPT (Parrinello-Rahman) completed successfully")
+            summary['npt_completed'] = True
+            summary['final_structure'] = 'equilibration/npt_pr/npt_pr.gro'
+            summary['final_checkpoint'] = 'equilibration/npt_pr/npt_pr.cpt'
+        else:
+            raise EquilibrationError("NPT (Parrinello-Rahman) output not found")
+
+        logger.info(f"\u2713 Equilibration complete for {metadata['peptide_id']} ({use_tag})")
+        return npt2_gro
+
+    finally:
+        # Always persist a summary of what completed
+        try:
+            equil_dir = os.path.join(run_dir, "equilibration")
+            os.makedirs(equil_dir, exist_ok=True)
+            with open(os.path.join(equil_dir, "summary.yaml"), 'w') as f:
+                yaml.dump(summary, f, default_flow_style=False)
+        except Exception as e:
+            logger.warning(f"Could not write equilibration summary: {e}")
 
 def main():
     parser = argparse.ArgumentParser(
@@ -710,9 +811,13 @@ def main():
     
     # Load configuration
     config = load_config(args.config)
-    
-    # Run equilibration
-    final_gro = equilibrate_system(args.run_dir, args.occupancy, tag=args.tag, config=config)
+
+    # Run equilibration with error handling
+    try:
+        final_gro = equilibrate_system(args.run_dir, args.occupancy, tag=args.tag, config=config)
+    except EquilibrationError as e:
+        logger.error(str(e))
+        sys.exit(1)
     
     next_tag = args.tag if args.tag else args.occupancy
     logger.info(f"Next step: Run production simulation")

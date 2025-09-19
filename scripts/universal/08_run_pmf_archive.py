@@ -1955,7 +1955,7 @@ pull-coord1-start       = yes
         if successful_windows < len(window_centers):
             self.logger.warning(f"⚠ {len(window_centers) - successful_windows} windows failed")
             self.logger.warning("  Check the output for error messages")
-        self.logger.info("Next step: Run MBAR/WHAM analysis")
+        self.logger.info("Next step: Run MBAR analysis")
         self.logger.info(f"Command: python scripts/analysis/pmf_mbar_analysis.py {pmf_dir}")
 
         return metadata

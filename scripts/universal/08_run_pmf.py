@@ -190,6 +190,8 @@ class PMFRunner:
         # Handlers are attached lazily in run_pmf_calculation when pmf_dir is known
         # Round history for QC provenance
         self.round_history = []
+        # Cache for expensive QC computations keyed by pullx path metadata
+        self._window_qc_cache: dict[tuple, dict] = {}
 
     # --- Region helpers (bulk/approach/interface) ---
     def _region_for_center(self, z: float) -> str:
@@ -198,6 +200,34 @@ class PMFRunner:
         if z >= 0.6:
             return "approach"
         return "interface"
+
+    # --- PBC helpers (XY) ---
+    @staticmethod
+    def _pbc_wrap(d: float, L: float) -> float:
+        try:
+            import numpy as _np
+            return d - float(_np.rint(d / L)) * L if L and L > 0 else d
+        except Exception:
+            return d
+
+    def _pbc_d2_xy(self, x: float, y: float, x0: float, y0: float, Lx: float | None, Ly: float | None) -> float:
+        dx = self._pbc_wrap(x - x0, Lx) if Lx else (x - x0)
+        dy = self._pbc_wrap(y - y0, Ly) if Ly else (y - y0)
+        return float(dx*dx + dy*dy)
+
+    @staticmethod
+    def _box_lengths_from_gro(path: Path) -> tuple[float | None, float | None]:
+        try:
+            with open(path, 'r') as f:
+                lines = f.readlines()
+            if not lines:
+                return (None, None)
+            parts = [float(x) for x in lines[-1].strip().split()]
+            if len(parts) >= 2:
+                return (parts[0], parts[1])
+        except Exception:
+            pass
+        return (None, None)
 
     def _region_cfg(self, z: float) -> dict:
         """Return region-specific QC thresholds with YAML overrides (deep-merge)."""
@@ -241,6 +271,8 @@ class PMFRunner:
         else:
             # Fallback to standard config
             std_config_path = Path(__file__).parent.parent.parent / "config" / "solvia_config.yaml"
+            if not std_config_path.exists():
+                raise FileNotFoundError(f"No PMF config found at {pmf_config_path} or {std_config_path}")
             with open(std_config_path, 'r') as f:
                 return yaml.safe_load(f)
     
@@ -413,7 +445,7 @@ class PMFRunner:
         )
         return out_path
 
-    def create_midplane_patch_reference_group(self, gro_atoms, peptide_indices, patch_radius=2.5, min_per_leaflet=10):
+    def create_midplane_patch_reference_group(self, gro_atoms, peptide_indices, patch_radius=2.5, min_per_leaflet=10, box_xy: tuple | None = None):
         """Create a local midplane reference group by balancing Outer/Inner PO4 around peptide.
 
         - Select PO4/P within XY radius of peptide COM.
@@ -426,6 +458,12 @@ class PMFRunner:
         if pep_xyz.size == 0:
             raise ValueError("No peptide atoms found")
         pep_xy = pep_xyz[:, :2].mean(axis=0)
+        Lx = Ly = None
+        try:
+            if box_xy:
+                Lx, Ly = box_xy
+        except Exception:
+            Lx = Ly = None
 
         # Split leaflets
         outer_ids, inner_ids = self._split_leaflets(gro_atoms)
@@ -457,7 +495,7 @@ class PMFRunner:
         R0 = patch_radius
         R = R0
         def in_radius(lst, R):
-            return [(i, x, y) for (i, x, y) in lst if (x - pep_xy[0])**2 + (y - pep_xy[1])**2 <= R*R]
+            return [(i, x, y) for (i, x, y) in lst if self._pbc_d2_xy(x, y, pep_xy[0], pep_xy[1], Lx, Ly) <= R*R]
         for _ in range(10):
             o_sel = in_radius(outer_cand, R)
             i_sel = in_radius(inner_cand, R)
@@ -474,13 +512,13 @@ class PMFRunner:
             return combined
         # Take nearest m from each side by XY distance
         def take_nearest(sel, m):
-            sel = sorted(sel, key=lambda t: (t[1]-pep_xy[0])**2 + (t[2]-pep_xy[1])**2)
+            sel = sorted(sel, key=lambda t: self._pbc_d2_xy(t[1], t[2], pep_xy[0], pep_xy[1], Lx, Ly))
             return [i for (i, _x, _y) in sel[:m]]
         o_ids = take_nearest(o_sel, m)
         i_ids = take_nearest(i_sel, m)
         return o_ids + i_ids
 
-    def create_patch_reference_group(self, gro_atoms, peptide_indices, patch_radius=2.0):
+    def create_patch_reference_group(self, gro_atoms, peptide_indices, patch_radius=2.0, box_xy: tuple | None = None):
         """
         Create local patch reference from phosphates near peptide using OuterPO4 indices
         if available; fallback to all PO4/P atoms.
@@ -490,6 +528,12 @@ class PMFRunner:
         if pep_xyz.size == 0:
             raise ValueError("No peptide atoms found")
         pep_xy = pep_xyz[:, :2].mean(axis=0)
+        Lx = Ly = None
+        try:
+            if box_xy:
+                Lx, Ly = box_xy
+        except Exception:
+            Lx = Ly = None
 
         # candidate phosphate indices
         outer_indices = set(self.load_outer_po4_indices())
@@ -506,7 +550,7 @@ class PMFRunner:
         patch = []
         R = patch_radius
         while True:
-            patch = [idx for idx,x,y in candidates if ( (x - pep_xy[0])**2 + (y - pep_xy[1])**2 ) <= R*R ]
+            patch = [idx for idx,x,y in candidates if self._pbc_d2_xy(x, y, pep_xy[0], pep_xy[1], Lx, Ly) <= R*R]
             if len(patch) >= 10 or R >= patch_radius + 2.0:
                 break
             R += 0.5
@@ -522,53 +566,58 @@ class PMFRunner:
         biased coordinate is defined against the same atoms across windows.
         """
         gro_atoms = self.read_gro_atoms(gro_path)
+        Lx, Ly = self._box_lengths_from_gro(Path(gro_path))
 
         # Find peptide
         peptide_indices = self.find_peptide_indices(gro_atoms)
         if not peptide_indices:
             raise ValueError("No peptide found in structure")
 
-        # Get reference mode
-        ref_mode = ref_mode_override or self.umbrella_config.get('ref_mode', 'patch')
+        # Get reference mode (default to global for stability)
+        ref_mode = ref_mode_override or self.umbrella_config.get('ref_mode', 'global')
 
         if ref_mode == 'midplane_local':
-            patch_radius = self.umbrella_config.get('patch_radius', 2.5)
+            patch_radius = float(getattr(self, 'autopatch_radius_nm', self.umbrella_config.get('patch_radius', 2.5)))
             reference_indices = self.create_midplane_patch_reference_group(
-                gro_atoms, peptide_indices, patch_radius
+                gro_atoms, peptide_indices, patch_radius, box_xy=(Lx, Ly)
             )
             ref_group_name = "LocalMidplane"
         elif ref_mode == 'hybrid':
             # Try midplane_local first, validate; fall back to local patch, then global PO4
             ref_group_name = "LocalMidplane"
-            patch_radius = self.umbrella_config.get('patch_radius', 2.5)
+            patch_radius = float(getattr(self, 'autopatch_radius_nm', self.umbrella_config.get('patch_radius', 2.5)))
             try:
                 reference_indices = self.create_midplane_patch_reference_group(
-                    gro_atoms, peptide_indices, patch_radius
+                    gro_atoms, peptide_indices, patch_radius, box_xy=(Lx, Ly)
                 )
             except Exception:
                 reference_indices = []
-            if not reference_indices or not self._validate_reference_group(gro_atoms, reference_indices, 0.95):
+            if not reference_indices or not self._validate_reference_group(gro_atoms, reference_indices, 0.95, ref_group_name, box_xy=(Lx, Ly)):
                 ref_group_name = "LocalPatch"
-                patch_radius = self.umbrella_config.get('patch_radius', 2.0)
+                patch_radius = float(getattr(self, 'autopatch_radius_nm', self.umbrella_config.get('patch_radius', 2.0)))
                 try:
                     reference_indices = self.create_patch_reference_group(
-                        gro_atoms, peptide_indices, patch_radius
+                        gro_atoms, peptide_indices, patch_radius, box_xy=(Lx, Ly)
                     )
                 except Exception:
                     reference_indices = []
-            if not reference_indices or not self._validate_reference_group(gro_atoms, reference_indices, 0.95):
-                ref_group_name = "UpperPO4"
+            if not reference_indices or not self._validate_reference_group(gro_atoms, reference_indices, 0.95, ref_group_name, box_xy=(Lx, Ly)):
+                ref_group_name = "GlobalMidplane"
                 reference_indices = [i+1 for i, (_r, a, *_xyz) in enumerate(gro_atoms) if a in ("PO4","P")]
         elif ref_mode == 'patch':
             # LOCAL PATCH REFERENCE (key improvement)
-            patch_radius = self.umbrella_config.get('patch_radius', 2.0)
+            patch_radius = float(getattr(self, 'autopatch_radius_nm', self.umbrella_config.get('patch_radius', 2.0)))
             reference_indices = self.create_patch_reference_group(
-                gro_atoms, peptide_indices, patch_radius
+                gro_atoms, peptide_indices, patch_radius, box_xy=(Lx, Ly)
             )
             ref_group_name = "LocalPatch"
+        elif ref_mode in ('global', 'po4', 'po4_all', 'upperpo4'):
+            # Global midplane reference: all PO4/P atoms across both leaflets
+            reference_indices = [i+1 for i, (_r, a, *_xyz) in enumerate(gro_atoms) if a in ("PO4","P")]
+            ref_group_name = "GlobalMidplane"
         else:
             reference_indices = [i+1 for i, (_r, a, *_xyz) in enumerate(gro_atoms) if a in ("PO4","P")]
-            ref_group_name = "UpperPO4"
+            ref_group_name = "GlobalMidplane"
 
         # Write index file
         with open(output_ndx, 'w') as f:
@@ -624,26 +673,35 @@ class PMFRunner:
                 # Normalize names (strip)
                 groups = [g.strip() for g in groups]
                 # Choose the best available, in this priority
-                for candidate in ("LocalMidplane", "LocalPatch", "UpperPO4"):
+                for candidate in ("GlobalMidplane", "LocalMidplane", "LocalPatch", "UpperPO4"):
                     if candidate in groups:
                         self.common_ref_group = candidate
                         break
                 else:
                     # Fallback if none found
                     self.common_ref_group = "LocalPatch"
-                # Compute a central pbcatom for the reference group
+                # Compute a central pbcatom for the reference group (or COM for LocalMidplane)
                 gro_atoms = self.read_gro_atoms(gro_path)
-                self.common_pbcatom1_index = self._compute_pbcatom(idx_path, self.common_ref_group, gro_atoms)
+                if self.common_ref_group in ('LocalMidplane','GlobalMidplane'):
+                    self.common_pbcatom1_index = 0
+                else:
+                    self.common_pbcatom1_index = self._compute_pbcatom(idx_path, self.common_ref_group, gro_atoms)
             except Exception:
                 self.common_ref_group = 'LocalPatch'
             return self.common_index_file, self.common_ref_group
-        # Otherwise, create new according to config
+        # Otherwise, create new according to config and validate it
         idx_file, ref_group = self.create_dynamic_index_file(gro_path, idx_path)
+        gro_atoms = self.read_gro_atoms(gro_path)
+        LxLy = self._box_lengths_from_gro(Path(gro_path))
+        ref_ids = self._parse_ndx_group(idx_file, ref_group)
+        if (not ref_ids) or (not self._validate_reference_group(gro_atoms, ref_ids, 0.95, ref_group, box_xy=LxLy)):
+            idx_file, ref_group = self.create_dynamic_index_file(gro_path, idx_path, ref_mode_override='global')
         self.common_index_file = str(idx_file)
         self.common_ref_group = ref_group
-        # Compute central pbcatom
-        gro_atoms = self.read_gro_atoms(gro_path)
-        self.common_pbcatom1_index = self._compute_pbcatom(idx_path, self.common_ref_group, gro_atoms)
+        if self.common_ref_group in ('LocalMidplane','GlobalMidplane'):
+            self.common_pbcatom1_index = 0
+        else:
+            self.common_pbcatom1_index = self._compute_pbcatom(idx_path, self.common_ref_group, gro_atoms)
         return self.common_index_file, self.common_ref_group
 
     def _parse_ndx_group(self, ndx_path: Path, group_name: str):
@@ -664,13 +722,63 @@ class PMFRunner:
                             idxs.append(int(p))
         return idxs
 
-    def _validate_reference_group(self, gro_atoms, ref_indices, threshold: float = 0.95) -> bool:
-        """Validate reference group spatial consistency (simple outlier test)."""
+    def _preflight_reference_index(self, gro_path: Path, pmf_dir: Path):
+        """Validate the presence and health of the common index and reference group.
+
+        Ensures:
+        - common_index.ndx exists
+        - reference group exists and has sufficient atoms
+        - pbcatom selection is resolvable (or COM for midplane groups)
+        """
+        if not self.consistent_reference:
+            return
+        if not self.common_index_file or not Path(self.common_index_file).exists():
+            raise RuntimeError("Preflight: common index missing; cannot proceed")
+        idx_path = Path(self.common_index_file)
+        ref_group = self.common_ref_group or 'GlobalMidplane'
+        ids = self._parse_ndx_group(idx_path, ref_group)
+        if not ids or len(ids) < 5:
+            raise RuntimeError(f"Preflight: reference group '{ref_group}' missing/too small in {idx_path}")
+        # Compactness validation (XY for midplane groups)
+        gro_atoms = self.read_gro_atoms(gro_path)
+        LxLy = self._box_lengths_from_gro(Path(gro_path))
+        if not self._validate_reference_group(gro_atoms, ids, 0.95, ref_group, box_xy=LxLy):
+            raise RuntimeError(f"Preflight: reference group '{ref_group}' failed compactness validation")
+        # Attempt to compute pbcatom unless using a midplane group
+        if ref_group not in ('LocalMidplane','GlobalMidplane'):
+            gro_atoms = self.read_gro_atoms(gro_path)
+            pb = int(self._compute_pbcatom(idx_path, ref_group, gro_atoms))
+            if pb <= 0:
+                raise RuntimeError("Preflight: could not determine pbcatom for reference group; aborting")
+
+    def _validate_reference_group(self, gro_atoms, ref_indices, threshold: float = 0.95, group_name: str | None = None, box_xy: tuple | None = None) -> bool:
+        """Validate reference group compactness with midplane-aware logic.
+
+        - For bimodal z distributions (e.g., LocalMidplane) or when explicitly
+          named 'LocalMidplane', evaluate compactness in XY only.
+        - Otherwise evaluate 3D compactness around the mean.
+        Uses IQR-based outlier fraction and compares against threshold.
+        """
         try:
             if not ref_indices or len(ref_indices) < 5:
                 return False
             coords = np.array([gro_atoms[i-1][2:5] for i in ref_indices], dtype=float)
-            d = np.linalg.norm(coords - coords.mean(axis=0), axis=1)
+            z = coords[:, 2]
+            z_spread = float(np.std(z))
+            bimodal_like = (z_spread > 0.5) or (group_name in ('LocalMidplane','GlobalMidplane'))
+            if bimodal_like:
+                xy = coords[:, :2]
+                # PBC-aware XY distances around COM if box provided
+                Lx = Ly = None
+                try:
+                    if box_xy:
+                        Lx, Ly = box_xy
+                except Exception:
+                    Lx = Ly = None
+                com = xy.mean(axis=0)
+                d = np.array([np.sqrt(self._pbc_d2_xy(p[0], p[1], com[0], com[1], Lx, Ly)) for p in xy], dtype=float)
+            else:
+                d = np.linalg.norm(coords - coords.mean(axis=0), axis=1)
             q1, q3 = np.percentile(d, [25, 75])
             iqr = q3 - q1 if q3 > q1 else (np.std(d) * 1.349)
             outliers = np.sum((d < q1 - 1.5*iqr) | (d > q3 + 1.5*iqr))
@@ -693,9 +801,10 @@ class PMFRunner:
         if pbc_type == 'orthorhombic' and B.ndim == 1 and B.size >= 3:
             d = q - p
             Lx, Ly, Lz = float(B[0]), float(B[1]), float(B[2])
-            if Lx > 0: d[0] -= round(d[0] / Lx) * Lx
-            if Ly > 0: d[1] -= round(d[1] / Ly) * Ly
-            if Lz > 0: d[2] -= round(d[2] / Lz) * Lz
+            import numpy as _np
+            if Lx > 0: d[0] -= float(_np.rint(d[0] / Lx)) * Lx
+            if Ly > 0: d[1] -= float(_np.rint(d[1] / Ly)) * Ly
+            if Lz > 0: d[2] -= float(_np.rint(d[2] / Lz)) * Lz
             return float(np.linalg.norm(d))
         if B.shape == (3, 3):
             H = B
@@ -732,7 +841,8 @@ class PMFRunner:
         ref_z = _np.mean([atoms[i-1][4] for i in ref])
         dz = float(pep_z - ref_z)
         if zbox and zbox > 0:
-            dz = dz - round(dz / zbox) * zbox
+            import numpy as _np
+            dz = dz - float(_np.rint(dz / zbox)) * zbox
         return dz
 
     def run_smd_ladder(self, start_structure: Path, target_z: float, output_dir: Path,
@@ -925,8 +1035,8 @@ pull-coord1-start       = yes
             current -= z_range.get('coarse_step', 0.2)
         windows = _dedup_sorted_centers(windows)
         # Auto densify based on target overlap
-        k = float(self.umbrella_config.get('force_constant', 900))
-        dz_max = _dz_max_for_overlap(float(self.temperature_K), k, float(self.target_overlap))
+        k_global = float(self.umbrella_config.get('force_constant', 900))
+        dz_max = _dz_max_for_overlap(float(self.temperature_K), k_global, float(self.target_overlap))
         densified = [windows[0]]
         for c in windows[1:]:
             prev = densified[-1]
@@ -987,6 +1097,37 @@ pull-coord1-start       = yes
         overlap = float(np.minimum(h1, h2).sum() * bw)
         return max(0.0, min(1.0, overlap))
 
+    # --- QC helpers with caching -------------------------------------------------
+
+    def _qc_cache_key(self, pullx_path: str | Path) -> tuple:
+        """Return a stat-based cache key for a pullx file."""
+        try:
+            st = os.stat(pullx_path)
+            return (str(pullx_path), st.st_size, st.st_mtime_ns)
+        except FileNotFoundError:
+            return (str(pullx_path), None, None)
+
+    def _get_window_qc(self, pullx_path: str, k_kj_mol_nm2: float, center_nm: float,
+                        half_energy_tol_kj: float) -> dict:
+        """Return QC metrics for a window, using a cached result when possible."""
+        cache_key = (self._qc_cache_key(pullx_path),
+                     round(float(k_kj_mol_nm2), 6),
+                     round(float(center_nm), 6),
+                     round(float(half_energy_tol_kj), 6))
+        cached = self._window_qc_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        qc = self.compute_window_qc(pullx_path, k_kj_mol_nm2, center_nm, half_energy_tol_kj)
+        self._window_qc_cache[cache_key] = qc
+        return qc
+
+    def _invalidate_qc_cache(self, pullx_path: str | Path) -> None:
+        """Drop cached entries referencing a given pullx file (used after reruns)."""
+        pullx_path = str(pullx_path)
+        keys_to_drop = [key for key in self._window_qc_cache if key[0][0] == pullx_path]
+        for key in keys_to_drop:
+            self._window_qc_cache.pop(key, None)
+
     def compute_window_qc(self, pullx_path: str, k_kj_mol_nm2: float, center_nm: float,
                            half_energy_tol_kj: float = 2.0):
         """QC with telemetry: ESS, ESS-rate, half-energy, Half-Z, drift, tau_int, sigmas."""
@@ -1043,14 +1184,20 @@ pull-coord1-start       = yes
         e1 = mean_bias(z[:mid]); e2 = mean_bias(z[mid:])
         de = abs(e1 - e2)
 
-        # Half-Z test on means
+        # Half-Z test on means (use effective sample size to account for correlation)
         import math as _m
         m1 = float(np.mean(z[:mid])) if mid > 1 else float(np.mean(z))
         m2 = float(np.mean(z[mid:])) if len(z) - mid > 1 else float(np.mean(z))
         s1 = float(np.var(z[:mid], ddof=1)) if mid > 1 else 0.0
         s2 = float(np.var(z[mid:], ddof=1)) if len(z) - mid > 1 else 0.0
-        n1 = max(1, mid); n2 = max(1, len(z) - mid)
-        se = _m.sqrt((s1 / n1) + (s2 / n2)) if (n1 > 1 and n2 > 1 and (s1 > 0 or s2 > 0)) else float('inf')
+        # Effective sample sizes per half (more conservative and robust)
+        try:
+            n1_eff = int(max(1, _ess_pymbar(z[:mid])))
+            n2_eff = int(max(1, _ess_pymbar(z[mid:])))
+        except Exception:
+            n1_eff = max(1, mid)
+            n2_eff = max(1, len(z) - mid)
+        se = _m.sqrt((s1 / n1_eff) + (s2 / n2_eff)) if (n1_eff > 1 and n2_eff > 1 and (s1 > 0 or s2 > 0)) else float('inf')
         half_z_stat = abs((m1 - m2) / se) if _m.isfinite(se) and se > 0 else 0.0
 
         # Drift
@@ -1111,9 +1258,11 @@ pull-coord1-start       = yes
             )
 
         # Determine pbcatom for reference group
-        pbcatom1 = 0
-        if self.consistent_reference and getattr(self, 'common_pbcatom1_index', None):
-            pbcatom1 = int(self.common_pbcatom1_index)
+        using_common_index = bool(self.consistent_reference and self.common_index_file and not ref_mode_override)
+        if ref_group in ('LocalMidplane','GlobalMidplane'):
+            pbcatom1 = 0
+        elif using_common_index:
+            pbcatom1 = int(self.common_pbcatom1_index or 0)
         else:
             gro_atoms = self.read_gro_atoms(start_structure)
             pbcatom1 = int(self._compute_pbcatom(index_file, ref_group, gro_atoms))
@@ -1121,10 +1270,10 @@ pull-coord1-start       = yes
         ref_ids = self._parse_ndx_group(index_file, ref_group)
         if not ref_ids:
             raise RuntimeError(f"Reference group '{ref_group}' is empty or missing in index {index_file}.")
-        if pbcatom1 <= 0:
+        if pbcatom1 <= 0 and ref_group not in ('LocalMidplane','GlobalMidplane'):
             raise RuntimeError(
                 "No valid pbcatom for reference group. Ensure the reference group contains atoms "
-                "and that index_leaflets.ndx/patch selection are correct."
+                "and that the common index contains the selected reference group."
             )
 
         
@@ -1171,11 +1320,180 @@ pull-coord1-start       = yes
             if smd_gro and Path(smd_gro).exists():
                 structure_for_grompp = Path(smd_gro)
 
-        # Validate reference group consistency (warn if poor) after input structure is known
+        # (moved) Reference validation is performed after optional pre-equilibration for robustness
+
+        # --- Optional pre-equilibration at target z to damp initial forces ---
+        try:
+            pre_eq_ns = float(self.umbrella_config.get('pre_equil_ns', 0.0) or 0.0)
+        except Exception:
+            pre_eq_ns = 0.0
+        do_pre_eq = (pre_eq_ns > 0.0) and not (extend_time > 0)
+        if do_pre_eq:
+            preeq_mdp = window_dir / "preeq.mdp"
+            preeq_tpr = window_dir / "preeq.tpr"
+            preeq_deffnm = window_dir / "preeq"
+            # Output stride similar to production
+            try:
+                pull_out_ps = float(self.umbrella_config.get('pull_output_ps', 1.0))
+            except Exception:
+                pull_out_ps = 1.0
+            out_every = max(1, int(round(pull_out_ps / 0.02)))
+            preeq_mdp_content = f"""
+; Short pre-equilibration at target z
+integrator              = md
+dt                      = 0.02
+nsteps                  = {int(pre_eq_ns * 1000 / 0.02)}
+nstcomm                 = 100
+
+; Output (sparse)
+nstxout                 = 0
+nstvout                 = 0
+nstfout                 = 0
+nstlog                  = 500
+nstenergy               = 500
+nstxout-compressed      = 500
+
+; Neighbor searching
+cutoff-scheme           = Verlet
+nstlist                 = 20
+pbc                     = xyz
+verlet-buffer-tolerance = 0.005
+
+; Electrostatics and VdW (Martini 3)
+coulombtype             = reaction-field
+rcoulomb                = 1.1
+epsilon_r               = 15
+vdw-type                = Cut-off
+vdw-modifier            = Potential-shift-verlet
+rvdw                    = 1.1
+
+; Thermostat
+tcoupl                  = v-rescale
+tc-grps                 = System
+tau-t                   = 1.0
+ref-t                   = {int(self.temperature_K)}
+
+; Pressure coupling (softer)
+pcoupl                  = berendsen
+pcoupltype              = semiisotropic
+tau-p                   = 12.0
+ref-p                   = 1.0 1.0
+compressibility         = 4.5e-5 0
+
+; Continuation (no new velocities)
+gen-vel                 = no
+continuation            = yes
+
+; Constraints
+constraints             = none
+constraint-algorithm    = lincs
+
+; Pull code – same geometry as production
+pull                    = yes
+pull-ngroups            = 2
+pull-ncoords            = 1
+pull-group1-name        = {ref_group}
+pull-group2-name        = Peptide
+pull-group1-pbcatom     = {pbcatom1}
+pull-group2-pbcatom     = 0
+pull-pbc-ref-prev-step-com = yes
+pull-coord1-type        = umbrella
+pull-coord1-geometry    = distance
+pull-coord1-dim         = N N Y
+pull-coord1-groups      = 1 2
+pull-coord1-init        = {window_center}
+pull-coord1-k           = {int(force_k)}
+pull-coord1-start       = no
+
+; Pull output
+pull-nstxout            = {out_every}
+pull-nstfout            = {out_every}
+"""
+            with open(preeq_mdp, 'w') as f:
+                f.write(preeq_mdp_content)
+
+            # Build and run pre-equilibration TPR/MD
+            project_root = Path(__file__).parent.parent.parent
+            top_file = self.find_topology_file()
+            rel_preeq_mdp = os.path.relpath(preeq_mdp, project_root)
+            rel_structure = os.path.relpath(structure_for_grompp, project_root)
+            rel_top = os.path.relpath(top_file, project_root)
+            rel_index = os.path.relpath(index_file, project_root)
+            rel_preeq_tpr = os.path.relpath(preeq_tpr, project_root)
+            rel_preeq_deffnm = os.path.relpath(preeq_deffnm, project_root)
+            rel_window_dir = os.path.relpath(window_dir, project_root)
+            container_wd = f"/work/{rel_window_dir}"
+            grompp_preeq = [
+                "docker", "compose", "run", "--rm", "--workdir", container_wd, "gromacs",
+                "grompp",
+                "-f", f"/work/{rel_preeq_mdp}",
+                "-c", f"/work/{rel_structure}",
+                "-p", f"/work/{rel_top}",
+                "-n", f"/work/{rel_index}",
+                "-o", f"/work/{rel_preeq_tpr}",
+                "-maxwarn", "2"
+            ]
+            res_preq = subprocess.run(grompp_preeq, capture_output=True, text=True, cwd=str(project_root))
+            if res_preq.returncode != 0:
+                # Fallback for older GROMACS lacking pbcatom=0 support
+                if ref_group in ('LocalMidplane','GlobalMidplane') and pbcatom1 == 0:
+                    try:
+                        gro_atoms_fb = self.read_gro_atoms(structure_for_grompp)
+                        pb_fallback = int(self._compute_pbcatom(index_file, ref_group, gro_atoms_fb))
+                        mdp_fb = preeq_mdp_content.replace(f"pull-group1-pbcatom     = {pbcatom1}", f"pull-group1-pbcatom     = {pb_fallback}")
+                        with open(preeq_mdp, 'w') as f:
+                            f.write(mdp_fb)
+                        res_preq = subprocess.run(grompp_preeq, capture_output=True, text=True, cwd=str(project_root))
+                    except Exception:
+                        pass
+                # Additional fallback: replace group2 pbcatom COM (0) with central peptide atom
+                if res_preq.returncode != 0:
+                    try:
+                        gro_atoms_fb = self.read_gro_atoms(structure_for_grompp)
+                        pb2 = int(self._compute_pbcatom(index_file, 'Peptide', gro_atoms_fb))
+                        with open(preeq_mdp, 'r') as f:
+                            txt = f.read()
+                        txt2 = txt.replace("pull-group2-pbcatom     = 0", f"pull-group2-pbcatom     = {pb2}")
+                        if txt2 != txt:
+                            with open(preeq_mdp, 'w') as f:
+                                f.write(txt2)
+                            res_preq = subprocess.run(grompp_preeq, capture_output=True, text=True, cwd=str(project_root))
+                    except Exception:
+                        pass
+                if res_preq.returncode != 0:
+                    print(f"  ✗ Pre-equil grompp failed: {res_preq.stderr}")
+            else:
+                mdrun_preeq = [
+                    "docker", "compose", "run", "--rm", "--workdir", container_wd, "gromacs",
+                    "mdrun",
+                    "-deffnm", f"/work/{rel_preeq_deffnm}",
+                    "-s", f"/work/{rel_preeq_tpr}",
+                ]
+                # Ensure preeq.gro is written explicitly
+                rel_preeq_conf = os.path.relpath(window_dir / "preeq.gro", project_root)
+                mdrun_preeq += ["-c", f"/work/{rel_preeq_conf}"]
+                print(f"  Running pre-equilibration for {pre_eq_ns:.2f} ns …")
+                res_mdrun_preeq = subprocess.run(mdrun_preeq, capture_output=True, text=True, cwd=str(project_root))
+                if res_mdrun_preeq.returncode != 0:
+                    print(f"  ✗ Pre-equil mdrun failed: {res_mdrun_preeq.stderr}")
+                else:
+                    preeq_gro = window_dir / "preeq.gro"
+                    if preeq_gro.exists():
+                        structure_for_grompp = preeq_gro
+                        print("  ✓ Pre-equilibration done; using preeq.gro for production.")
+
+        # Validate reference group after optional pre-equilibration (PBC-aware XY)
         try:
             gro_atoms_check = self.read_gro_atoms(structure_for_grompp)
-            if not self._validate_reference_group(gro_atoms_check, ref_ids, threshold=0.95):
+            LxLy = self._box_lengths_from_gro(Path(structure_for_grompp))
+            if not self._validate_reference_group(gro_atoms_check, ref_ids, threshold=0.95, group_name=ref_group, box_xy=LxLy):
                 self.logger.warning("Reference group validation failed (outliers). Consider a more global PO4 reference.")
+                # Optional: in hybrid mode, fallback to global PO4 only if not enforcing consistent reference
+                if (self.umbrella_config.get('ref_mode', 'patch') == 'hybrid') and (not self.consistent_reference):
+                    index_file, ref_group = self.create_dynamic_index_file(structure_for_grompp, index_file, ref_mode_override='global')
+                    # Re-parse ids and recompute pbcatom for the switched group
+                    ref_ids = self._parse_ndx_group(index_file, ref_group)
+                    pbcatom1 = 0 if ref_group in ('LocalMidplane','GlobalMidplane') else int(self._compute_pbcatom(index_file, ref_group, gro_atoms_check))
         except Exception:
             pass
 
@@ -1228,7 +1546,6 @@ nstxout-compressed     = 1000
 ; Neighbor searching
 cutoff-scheme          = Verlet
 nstlist                = 20
-ns_type                = grid
 pbc                    = xyz
 verlet-buffer-tolerance = 0.005
 
@@ -1245,7 +1562,6 @@ tcoupl                 = v-rescale
 tc-grps                = System
 tau-t                  = 1.0
 ref-t                  = 310
-ld-seed                = {seed}
 
 ; Pressure coupling
 pcoupl                 = Parrinello-Rahman
@@ -1262,20 +1578,20 @@ continuation          = {"yes" if continuation_flag else "no"}
 constraints            = none
 constraint-algorithm   = lincs
 
-; Pull code - Umbrella
-pull                   = yes
-pull-ngroups          = 2
-pull-ncoords          = 1
-pull-group1-name      = {ref_group}
-pull-group2-name      = Peptide
-pull-group1-pbcatom   = {pbcatom1}
-pull-group2-pbcatom   = 0  ; Use COM as reference
-pull-pbc-ref-prev-step-com = yes  ; Use COM from previous step for PBC
-pull-coord1-type      = umbrella
-pull-coord1-geometry  = distance
-pull-coord1-dim       = N N Y
-pull-coord1-groups    = 1 2
-pull-coord1-init      = {window_center}
+        ; Pull code - Umbrella
+        pull                   = yes
+        pull-ngroups          = 2
+        pull-ncoords          = 1
+        pull-group1-name      = {ref_group}
+        pull-group2-name      = Peptide
+        pull-group1-pbcatom   = {pbcatom1}
+        pull-group2-pbcatom   = 0  ; Use COM as reference
+        pull-pbc-ref-prev-step-com = yes
+        pull-coord1-type      = umbrella
+        pull-coord1-geometry  = distance
+        pull-coord1-dim       = N N Y
+        pull-coord1-groups    = 1 2
+        pull-coord1-init      = {window_center}
 pull-coord1-k         = {int(force_k)}
 pull-coord1-start     = no  ; Use init value directly
 
@@ -1380,8 +1696,35 @@ define                 = -DPOSRES_LIPID_Z
             sys.stdout.flush()
             result = subprocess.run(grompp_cmd, capture_output=True, text=True, cwd=str(project_root))
             if result.returncode != 0:
-                print(f"  ✗ Error in grompp: {result.stderr}")
-                return None
+                # Fallback: if Local/Global Midplane with pbcatom1=0 is not supported by old GROMACS, retry with central atom
+                if ref_group in ('LocalMidplane','GlobalMidplane') and pbcatom1 == 0:
+                    try:
+                        gro_atoms_fb = self.read_gro_atoms(structure_for_grompp)
+                        pb_fallback = int(self._compute_pbcatom(index_file, ref_group, gro_atoms_fb))
+                        # Regenerate MDP with fallback pbcatom
+                        mdp_content_fb = mdp_content.replace(f"pull-group1-pbcatom   = {pbcatom1}", f"pull-group1-pbcatom   = {pb_fallback}")
+                        with open(mdp_file, 'w') as f:
+                            f.write(mdp_content_fb)
+                        result = subprocess.run(grompp_cmd, capture_output=True, text=True, cwd=str(project_root))
+                    except Exception:
+                        pass
+                # Additional fallback: replace group2 pbcatom COM (0) with central peptide atom if still failing
+                if result.returncode != 0:
+                    try:
+                        gro_atoms_fb = self.read_gro_atoms(structure_for_grompp)
+                        pb2 = int(self._compute_pbcatom(index_file, 'Peptide', gro_atoms_fb))
+                        with open(mdp_file, 'r') as f:
+                            txt = f.read()
+                        txt2 = txt.replace("pull-group2-pbcatom   = 0", f"pull-group2-pbcatom   = {pb2}")
+                        if txt2 != txt:
+                            with open(mdp_file, 'w') as f:
+                                f.write(txt2)
+                            result = subprocess.run(grompp_cmd, capture_output=True, text=True, cwd=str(project_root))
+                    except Exception:
+                        pass
+                if result.returncode != 0:
+                    print(f"  ✗ Error in grompp: {result.stderr}")
+                    return None
             print(f"  ✓ TPR file created")
         
         # Run mdrun via Docker
@@ -1406,6 +1749,9 @@ define                 = -DPOSRES_LIPID_Z
             "-pf", f"/work/{rel_pullf}",
             "-g", f"/work/{rel_log}"
         ]
+        # Force confout path to guarantee umbrella.gro availability even with append/resume
+        rel_confout = os.path.relpath(window_dir / "umbrella.gro", project_root)
+        mdrun_cmd += ["-c", f"/work/{rel_confout}"]
         # if extending, use checkpoint input and append
         rel_cpt = os.path.relpath(cpt_path, project_root)
         if extend_time > 0 and cpt_path.exists():
@@ -1430,7 +1776,7 @@ define                 = -DPOSRES_LIPID_Z
         lincs_flag = False
         for line in process.stdout:
             # Show progress lines (step updates)
-            if "step" in line.lower() or "Step" in line:
+            if "step" in line.lower():
                 # Clear line and print progress
                 sys.stdout.write(f"\r  Progress: {line.strip()[:80]}")
                 sys.stdout.flush()
@@ -1438,7 +1784,7 @@ define                 = -DPOSRES_LIPID_Z
             elif any(keyword in line for keyword in ["WARNING", "ERROR", "Note", "Writing", "Back Off!"]):
                 sys.stdout.write(f"\n  {line.strip()}\n")
                 sys.stdout.flush()
-                if ("LINCS WARNING" in line) or ("Back Off!" in line and re.search(r"step\\d+.*\\.pdb", line)):
+                if ("LINCS WARNING" in line) or ("Back Off!" in line):
                     lincs_flag = True
                     try:
                         process.terminate()
@@ -1455,13 +1801,15 @@ define                 = -DPOSRES_LIPID_Z
         sys.stdout.write("\n")  # New line after progress
         
         if process.returncode == 0 and not lincs_flag:
+            self._invalidate_qc_cache(pullx_file)
             print(f"✓ Window z={window_center:.3f} nm completed")
             return {
                 "center": window_center,
                 "pullf": str(pullf_file),
                 "pullx": str(pullx_file),
                 "tpr": str(tpr_file),
-                "seed": seed
+                "seed": seed,
+                "k": float(force_k)
             }
         # Attempt auto-recovery on LINCS or failure: short stabilization run with softer settings
         print(f"✗ Window z={window_center:.3f} nm encountered instability (LINCS or failure). Attempting stabilization…")
@@ -1515,20 +1863,20 @@ compressibility         = 4.5e-5 0
 constraints             = none
 constraint-algorithm    = lincs
 
-; Pull code - Umbrella (soft)
-pull                    = yes
-pull-ngroups            = 2
-pull-ncoords            = 1
-pull-group1-name        = {ref_group}
-pull-group2-name        = Peptide
-pull-group1-pbcatom     = {pbcatom1}
-pull-group2-pbcatom     = 0
-pull-pbc-ref-prev-step-com = yes
-pull-coord1-type        = umbrella
-pull-coord1-geometry    = distance
-pull-coord1-dim         = N N Y
-pull-coord1-groups      = 1 2
-pull-coord1-init        = {window_center}
+        ; Pull code - Umbrella (soft)
+        pull                    = yes
+        pull-ngroups            = 2
+        pull-ncoords            = 1
+        pull-group1-name        = {ref_group}
+        pull-group2-name        = Peptide
+        pull-group1-pbcatom     = {pbcatom1}
+        pull-group2-pbcatom     = 0
+        pull-pbc-ref-prev-step-com = yes
+        pull-coord1-type        = umbrella
+        pull-coord1-geometry    = distance
+        pull-coord1-dim         = N N Y
+        pull-coord1-groups      = 1 2
+        pull-coord1-init        = {window_center}
 pull-coord1-k           = {k_soft}
 pull-coord1-start       = yes
 """
@@ -1567,6 +1915,9 @@ pull-coord1-start       = yes
             "-deffnm", f"/work/{rel_stab_deffnm}",
             "-s", f"/work/{rel_stab_tpr}"
         ]
+        # Ensure stabilized confout is explicitly written
+        rel_stab_conf = os.path.relpath(window_dir / "stabilize.gro", project_root)
+        stab_mdrun += ["-c", f"/work/{rel_stab_conf}"]
         print("  Starting stabilization mdrun…")
         res2 = subprocess.run(stab_mdrun, capture_output=True, text=True, cwd=str(project_root))
         if res2.returncode != 0:
@@ -1609,13 +1960,13 @@ pull-coord1-start       = yes
         last_time = time.time()
         lincs_flag = False
         for line in process.stdout:
-            if "step" in line.lower() or "Step" in line:
+            if "step" in line.lower():
                 sys.stdout.write(f"\r  Progress: {line.strip()[:80]}")
                 sys.stdout.flush()
             elif any(keyword in line for keyword in ["WARNING", "ERROR", "Note", "Writing", "Back Off!"]):
                 sys.stdout.write(f"\n  {line.strip()}\n")
                 sys.stdout.flush()
-                if ("LINCS WARNING" in line) or ("Back Off!" in line and re.search(r"step\\d+.*\\.pdb", line)):
+                if ("LINCS WARNING" in line) or ("Back Off!" in line):
                     lincs_flag = True
             current_time = time.time()
             if current_time - last_time > 5:
@@ -1625,13 +1976,15 @@ pull-coord1-start       = yes
         process.wait()
         sys.stdout.write("\n")
         if process.returncode == 0 and not lincs_flag:
+            self._invalidate_qc_cache(pullx_file)
             print(f"✓ Window z={window_center:.3f} nm completed (after stabilization)")
             return {
                 "center": window_center,
                 "pullf": str(pullf_file),
                 "pullx": str(pullx_file),
                 "tpr": str(tpr_file),
-                "seed": seed
+                "seed": seed,
+                "k": float(force_k)
             }
         print(f"✗ Window z={window_center:.3f} nm failed even after stabilization")
         # Mark this window to avoid endless retries on resume
@@ -1710,6 +2063,15 @@ pull-coord1-start       = yes
                 continue
 
             add = float(min(add, self.max_extend_ns - already))
+            # Enforce global time budget per window if configured
+            try:
+                max_time_budget = float(self.qc_config.get('max_time_per_window', 0.0) or 0.0)
+            except Exception:
+                max_time_budget = 0.0
+            if max_time_budget > 0.0:
+                base_prod = float(self.umbrella_config.get('production_ns', 60.0))
+                if (base_prod + already + add) > max_time_budget:
+                    add = max(0.0, max_time_budget - base_prod - already)
             print(f"  ⤴ Extending window z={c:+.3f} by +{add:.1f} ns (ESS/half-time).")
             res = self.run_umbrella_window(c, window_dir, start_structure, replicate, extend_time=add)
             if res:
@@ -1763,7 +2125,7 @@ pull-coord1-start       = yes
                 targets.append(float(w['center']))
         targets = _dedup_sorted_centers(targets)
         if not targets:
-            return windows_data, 0
+            return windows_data, 0, []
 
         self.logger.warning(f"QC fallback: replicating {len(targets)} low-ESS/half-failing windows with {n_reps}×{rep_ns:.0f} ns")
 
@@ -1858,27 +2220,47 @@ pull-coord1-start       = yes
 
         Returns (overlap_ok, ess_ok).
         """
-        ol = all(item.get('passed', False) for item in qc_results.get('overlap_check', [])) if qc_results.get('overlap_check') else True
-        ess = all(item.get('passed', False) for item in qc_results.get('ess_check', [])) if qc_results.get('ess_check') else True
+        def _active(entries):
+            return [it for it in (entries or []) if not it.get('superseded', False)]
+
+        ol_entries = qc_results.get('overlap_check', [])
+        ess_entries = _active(qc_results.get('ess_check', []))
+        ol = all(item.get('passed', False) for item in ol_entries) if ol_entries else True
+        ess = all(item.get('passed', False) for item in ess_entries) if ess_entries else True
         return ol, ess
     
     def find_topology_file(self):
         """Find the appropriate topology file"""
-        # Look in PMF system directory first
-        pmf_dirs = list(self.run_dir.glob("pmf_system/replicate_*/system.top"))
-        if pmf_dirs:
-            return pmf_dirs[0]
-        
-        # Check system directory for any .top file
+        # Prefer replicate-specific PMF topology if available
+        try:
+            rep = getattr(self, 'replicate', None)
+        except Exception:
+            rep = None
+        if rep is not None:
+            specific = self.run_dir / "pmf_system" / f"replicate_{rep}" / "system.top"
+            if specific.exists():
+                return specific
+
+        # Prefer explicit system/*.top next (stable, non-ambiguous)
         system_tops = list(self.run_dir.glob("system/*.top"))
         if system_tops:
-            # Prefer system_n1.top if it exists (single peptide)
             for top in system_tops:
                 if "n1" in top.name:
                     return top
-            # Otherwise use the first one found
-            return system_tops[0]
-        
+            for top in system_tops:
+                if top.name == "system.top":
+                    return top
+            return sorted(system_tops)[0]
+
+        # Else choose newest pmf_system replicate if multiple exist
+        pmf_dirs = list(self.run_dir.glob("pmf_system/replicate_*/system.top"))
+        if pmf_dirs:
+            try:
+                pmf_dirs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+            except Exception:
+                pmf_dirs.sort()
+            return pmf_dirs[0]
+
         # Fallback to other locations
         possible_paths = [
             self.run_dir / "system" / "system.top",
@@ -1903,7 +2285,7 @@ pull-coord1-start       = yes
         val_windows = sorted([w for w in windows_data if w], key=lambda x: x['center'], reverse=True)
 
         # Overlap checks with region-strict thresholds and expected-vs-measured
-        k = float(self.umbrella_config.get('force_constant', 900))
+        k_global = float(self.umbrella_config.get('force_constant', 900))
         for i in range(len(val_windows) - 1):
             w1, w2 = val_windows[i], val_windows[i+1]
             if float(w1['center']) == float(w2['center']):
@@ -1912,7 +2294,8 @@ pull-coord1-start       = yes
             cfg1 = self._region_cfg(w1['center']); cfg2 = self._region_cfg(w2['center'])
             min_ol = max(float(cfg1["min_neighbor_overlap"]), float(cfg2["min_neighbor_overlap"]))
             dz = abs(float(w1['center']) - float(w2['center']))
-            expected = self._expected_overlap_gaussian(dz, k)
+            k1 = float(w1.get('k', k_global)); k2 = float(w2.get('k', k_global))
+            expected = self._expected_overlap_gaussian_mixed(dz, k1, k2)
             # JS divergence as additional diagnostic (histogram-based)
             jsd = None
             try:
@@ -1936,9 +2319,11 @@ pull-coord1-start       = yes
         # Per-window checks with region thresholds
         for w in val_windows:
             reg = self._region_cfg(w['center'])
-            qc = self.compute_window_qc(w['pullx'], k, w['center'], reg["half_energy_tol_kj"])
+            k_w = float(w.get('k', k_global))
+            qc = self._get_window_qc(w['pullx'], k_w, w['center'], reg["half_energy_tol_kj"])
             qc_results["ess_check"].append({
                 "center": w['center'],
+                "pullx": str(w['pullx']),
                 "ess": qc['ess'],
                 "ess_rate": qc.get('ess_rate'),
                 "time_ns": qc.get('time_ns'),
@@ -1956,6 +2341,7 @@ pull-coord1-start       = yes
                 "half_pass": bool(half_pass_reg),
                 "drift_nm_per_ns": qc.get('drift_nm_per_ns'),
                 "drift_pass": qc.get('drift_pass', False),
+                "pullx": str(w['pullx']),
             }
             conv_item["passed"] = bool(conv_item["half_pass"]) and bool(conv_item.get('drift_pass', True))
             qc_results["convergence_check"].append(conv_item)
@@ -2001,11 +2387,22 @@ pull-coord1-start       = yes
             'reference_group': self.common_ref_group,
             'index_file': str(Path(self.common_index_file).relative_to(self.run_dir)) if self.common_index_file else None,
         }
+        # Peptide footprint proxy (if available)
+        try:
+            if getattr(self, '_peptide_rg_xy', None) is not None:
+                manifest['peptide'] = {'rg_xy_nm': float(self._peptide_rg_xy)}
+        except Exception:
+            pass
         # Windows and QC summary
         manifest['windows'] = {
             'centers': window_centers,
             'n_windows': len(window_centers),
         }
+        # Record effective patch radius used
+        try:
+            manifest['reference']['patch_radius_nm'] = float(getattr(self, 'autopatch_radius_nm', self.umbrella_config.get('patch_radius', 2.0)))
+        except Exception:
+            manifest['reference']['patch_radius_nm'] = float(self.umbrella_config.get('patch_radius', 2.0))
         # Persist
         run_info = pmf_dir / "RUN_INFO.yaml"
         try:
@@ -2014,6 +2411,95 @@ pull-coord1-start       = yes
         except Exception as e:
             print(f"Warning: failed to write RUN_INFO.yaml: {e}")
         return run_info
+
+    def run_preflight(self, replicate=1, tag=None):
+        """Validate starting structure, common index/reference, and planned windows without running MD."""
+        pmf_dir = self.run_dir / "pmf"
+        pmf_dir = pmf_dir / (tag if tag else f"replicate_{replicate}")
+        pmf_dir.mkdir(parents=True, exist_ok=True)
+        self._setup_logging(pmf_dir)
+        try:
+            self.replicate = int(replicate)
+        except Exception:
+            self.replicate = replicate
+
+        # Locate starting structure (same logic as run)
+        equil_dir = self.run_dir / "equilibration"
+        candidates = [
+            equil_dir / "npt" / "npt.gro",
+            equil_dir / "npt_pr.gro",
+            equil_dir / "nvt" / "nvt.gro",
+            equil_dir / "em" / "em.gro",
+            self.run_dir / "pmf_system" / f"replicate_{replicate}" / "system.gro",
+        ]
+        start_structure = next((p for p in candidates if p.exists()), None)
+        if not start_structure:
+            raise FileNotFoundError("Preflight: no starting structure found; run equilibration first.")
+
+        # Optional leaflet index
+        leaf = self.run_dir / "index_leaflets.ndx"
+        if not leaf.exists():
+            try:
+                self.generate_leaflet_index(start_structure, leaf)
+            except Exception as e:
+                self.logger.warning(f"Preflight: could not generate index_leaflets.ndx: {e}")
+
+        # Ensure one common index/reference and validate
+        idx_file, ref_group = self.ensure_common_index(start_structure, pmf_dir)
+        self._preflight_reference_index(start_structure, pmf_dir)
+
+        # Window plan and overlap geometry
+        centers = self.calculate_window_positions()
+        adapt_k_cfg = (self.umbrella_config.get('adaptive_k') or {})
+        k_base = float(self.umbrella_config.get('force_constant', 900))
+        if bool(adapt_k_cfg.get('enabled', False)):
+            sigma_target = float(adapt_k_cfg.get('sigma_target_nm', 0.06))
+            k_min = float(adapt_k_cfg.get('k_min', 200.0))
+            k_max = float(adapt_k_cfg.get('k_max', 5000.0))
+            k_eff = float(np.clip(KB_KJ_MOL_K * float(self.temperature_K) / max(1e-9, sigma_target**2), k_min, k_max))
+        else:
+            k_eff = k_base
+        # z-critical for desired overlap (use built-in _ppf)
+        try:
+            zcrit = float(_ppf(1.0 - float(self.target_overlap)/2.0))
+        except Exception:
+            zcrit = 1.2815515655446004  # ~ppf(0.9)
+        sigma = float(math.sqrt(KB_KJ_MOL_K * float(self.temperature_K) / float(k_eff)))
+        dz_max = float(2.0 * sigma * zcrit)
+
+        cs = sorted({float(f"{c:.3f}") for c in centers}, reverse=True)
+        densify_pred = []
+        for a, b in zip(cs[:-1], cs[1:]):
+            if abs(a - b) > 1.05 * dz_max:
+                densify_pred.append(float(f"{0.5*(a+b):.3f}"))
+
+        report = {
+            "start_structure": str(start_structure.relative_to(self.run_dir)),
+            "common_index": str(Path(idx_file).relative_to(self.run_dir)),
+            "reference_group": ref_group,
+            "temperature_K": float(self.temperature_K),
+            "k_base_kj_mol_nm2": float(k_base),
+            "k_effective_kj_mol_nm2": float(k_eff),
+            "sigma_nm": float(sigma),
+            "target_overlap": float(self.target_overlap),
+            "dz_max_nm_for_target_overlap": float(dz_max),
+            "planned_windows": cs,
+            "n_planned": len(cs),
+            "auto_densify": bool(self.umbrella_config.get('auto_densify', True)),
+            "predicted_midpoints_if_densify": densify_pred,
+            "n_predicted_additions": len(densify_pred),
+            "max_windows_budget": int((self.qc_config.get('max_windows') or 0) or 10**9),
+        }
+        with open(pmf_dir / "PREFLIGHT.yaml", "w") as f:
+            yaml.dump(report, f, default_flow_style=False)
+        print("\n=== Preflight summary ===")
+        for k, v in report.items():
+            if k in ("planned_windows", "predicted_midpoints_if_densify"):
+                continue
+            print(f"{k}: {v}")
+        print("planned_windows:", report["planned_windows"])
+        print("predicted_midpoints_if_densify:", report["predicted_midpoints_if_densify"])
+        return report
 
     def _expected_overlap_gaussian(self, dz: float, k_kj_mol_nm2: float) -> float:
         """Approximate expected overlap of two Gaussians of equal sigma separated by dz.
@@ -2027,19 +2513,35 @@ pull-coord1-start       = yes
         phi = 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
         return max(0.0, min(1.0, 2.0 * phi))
 
+    def _expected_overlap_gaussian_mixed(self, dz: float,
+                                         k1_kj_mol_nm2: float,
+                                         k2_kj_mol_nm2: float) -> float:
+        """Approximate expected overlap for two Gaussians with possibly different sigmas.
+
+        Uses an effective sigma: sigma_eff^2 = (sigma1^2 + sigma2^2) / 2.
+        """
+        import math
+        s1 = math.sqrt(max(1e-12, KB_KJ_MOL_K * float(self.temperature_K) / float(k1_kj_mol_nm2)))
+        s2 = math.sqrt(max(1e-12, KB_KJ_MOL_K * float(self.temperature_K) / float(k2_kj_mol_nm2)))
+        sigma_eff = math.sqrt(0.5 * (s1 * s1 + s2 * s2))
+        x = -abs(dz) / (2.0 * sigma_eff)
+        phi = 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+        return max(0.0, min(1.0, 2.0 * phi))
+
     def validate_window_consistency(self, pmf_dir: Path, windows_data, tolerance=0.1):
         """Validate pairwise consistency between adjacent windows.
 
         Compares measured vs expected overlaps; writes YAML to pmf_dir/window_consistency.yaml.
         """
-        k = float(self.umbrella_config.get('force_constant', 900))
+        k_global = float(self.umbrella_config.get('force_constant', 900))
         wins = sorted([w for w in windows_data if w], key=lambda x: x['center'], reverse=True)
         report = {"problematic_pairs": [], "passed": True}
         for a, b in zip(wins[:-1], wins[1:]):
             try:
                 ol = self.check_window_overlap(a['pullx'], b['pullx'], self.target_overlap)
                 dz = abs(float(a['center']) - float(b['center']))
-                ol_exp = self._expected_overlap_gaussian(dz, k)
+                k1 = float(a.get('k', k_global)); k2 = float(b.get('k', k_global))
+                ol_exp = self._expected_overlap_gaussian_mixed(dz, k1, k2)
                 if abs(ol - ol_exp) > float(tolerance):
                     report["problematic_pairs"].append({
                         'z1': float(a['center']), 'z2': float(b['center']),
@@ -2063,16 +2565,26 @@ pull-coord1-start       = yes
             if getattr(self, 'round_history', None):
                 qc_results = dict(qc_results)
                 qc_results["rounds"] = list(self.round_history)
+            # Attach peptide Rg_xy if available for cross-run comparability
+            if getattr(self, '_peptide_rg_xy', None) is not None:
+                qc_results["peptide"] = {"rg_xy_nm": float(self._peptide_rg_xy)}
         except Exception:
             pass
         with open(report_file, 'w') as f:
             yaml.dump(qc_results, f, default_flow_style=False)
-        n_ol_pass = sum(1 for c in qc_results.get('overlap_check', []) if c.get('passed'))
-        n_ol_total = len(qc_results.get('overlap_check', []))
-        n_ess_pass = sum(1 for c in qc_results.get('ess_check', []) if c.get('passed'))
-        n_ess_total = len(qc_results.get('ess_check', []))
-        n_half_pass = sum(1 for c in qc_results.get('convergence_check', []) if c.get('passed'))
-        n_half_total = len(qc_results.get('convergence_check', []))
+        def _active(entries):
+            return [c for c in (entries or []) if not c.get('superseded', False)]
+
+        overlap_entries = qc_results.get('overlap_check', [])
+        ess_entries = _active(qc_results.get('ess_check', []))
+        half_entries = _active(qc_results.get('convergence_check', []))
+
+        n_ol_pass = sum(1 for c in overlap_entries if c.get('passed'))
+        n_ol_total = len(overlap_entries)
+        n_ess_pass = sum(1 for c in ess_entries if c.get('passed'))
+        n_ess_total = len(ess_entries)
+        n_half_pass = sum(1 for c in half_entries if c.get('passed'))
+        n_half_total = len(half_entries)
         print("\n=== QC Report ===")
         print(f"Overlap checks: {n_ol_pass}/{n_ol_total} passed (region-aware thresholds)")
         print(f"ESS checks:     {n_ess_pass}/{n_ess_total} passed (region-aware thresholds)")
@@ -2104,6 +2616,13 @@ pull-coord1-start       = yes
         min_ess = int(fcfg.get('min_ess_keep', 20))
         min_keep = int(fcfg.get('min_keep_per_center', 1))
         keep_best_anyway = bool(fcfg.get('keep_best_if_all_filtered', True))
+        max_keep = fcfg.get('max_keep_per_center', 1)
+        try:
+            max_keep = int(max_keep)
+        except Exception:
+            max_keep = 1
+        if max_keep < 1:
+            max_keep = 0
         prefer_by = str(fcfg.get('prefer_by', 'ess')).lower()
 
         # Group windows by center
@@ -2111,14 +2630,15 @@ pull-coord1-start       = yes
         for w in [w for w in windows_data if w]:
             centers.setdefault(float(w['center']), []).append(w)
 
-        k = float(self.umbrella_config.get('force_constant', 900))
+        k_global = float(self.umbrella_config.get('force_constant', 900))
         selection = {}
         selected_windows = []
         for c, wins in sorted(centers.items(), key=lambda kv: kv[0], reverse=True):
             items = []
             for w in wins:
                 reg = self._region_cfg(w['center'])
-                qc = self.compute_window_qc(w['pullx'], k, w['center'], reg.get('half_energy_tol_kj', 2.0))
+                kw = float(w.get('k', k_global))
+                qc = self._get_window_qc(w['pullx'], kw, w['center'], reg.get('half_energy_tol_kj', 2.0))
                 # Region-aware half decision (ΔE + Z)
                 half_pass_reg = (float(qc.get('half_energy_diff_kj', float('inf'))) <= float(reg["half_energy_tol_kj"])) and \
                                 (float(qc.get('half_z_stat', 0.0)) <= float(reg["half_z_tol_sigma"]))
@@ -2158,6 +2678,12 @@ pull-coord1-start       = yes
                     survivors = items_sorted[:max(1, min_keep)]
                 else:
                     survivors = []
+            # Hard cap on survivors per center if requested
+            if max_keep and len(survivors) > max_keep:
+                if prefer_by.startswith('half'):
+                    survivors = sorted(survivors, key=lambda it: ((not it['qc']['half_pass']), -it['qc']['ess']))[:max_keep]
+                else:
+                    survivors = sorted(survivors, key=lambda it: (-it['qc']['ess']))[:max_keep]
             selection[float(c)] = {
                 'replicates': items,
                 'selected': [{'pullx': it['pullx'], 'ess': it['qc']['ess'], 'half_pass': it['qc']['half_pass']} for it in survivors],
@@ -2179,6 +2705,45 @@ pull-coord1-start       = yes
         except Exception:
             pass
         return selected_windows, selection
+
+    def _annotate_superseded_qc(self, qc_results: dict, selection: dict) -> dict:
+        """Mark QC entries belonging to filtered-out replicates as superseded.
+
+        Adds a boolean flag `superseded` to convergence/ESS entries when the
+        corresponding replicate was dropped by the QC filter so that reports
+        can hide or down-weight those failures.
+        """
+        if not selection:
+            return qc_results
+        try:
+            selected_pullx = set()
+            all_pullx = set()
+            for block in selection.values():
+                for sel in block.get('selected', []) or []:
+                    if sel.get('pullx'):
+                        selected_pullx.add(str(sel['pullx']))
+                for rep in block.get('replicates', []) or []:
+                    if rep.get('pullx'):
+                        all_pullx.add(str(rep['pullx']))
+            superseded = all_pullx - selected_pullx
+            if not superseded:
+                # Still annotate kept entries for completeness
+                relevant = selected_pullx
+            else:
+                relevant = selected_pullx
+            for section in ("convergence_check", "ess_check"):
+                for item in qc_results.get(section, []) or []:
+                    pullx = item.get('pullx')
+                    if not pullx:
+                        continue
+                    pullx_str = str(pullx)
+                    if pullx_str in superseded:
+                        item['superseded'] = True
+                    elif pullx_str in relevant:
+                        item['superseded'] = False
+        except Exception:
+            pass
+        return qc_results
     
     def _scan_existing_windows(self, pmf_dir: Path):
         """Return list of window dicts for existing window outputs, including replicates.
@@ -2195,16 +2760,37 @@ pull-coord1-start       = yes
             pullf = dir_path / "pullf.xvg"
             tpr = dir_path / "umbrella.tpr"
             if pullx.exists():
-                wins.append({
+                # Try to parse force constant k from umbrella.mdp
+                k_val = None
+                try:
+                    mdp_path = dir_path / "umbrella.mdp"
+                    if mdp_path.exists():
+                        with open(mdp_path, 'r') as mf:
+                            for ln in mf:
+                                if 'pull-coord1-k' in ln:
+                                    parts = ln.strip().split()
+                                    for tok in reversed(parts):
+                                        try:
+                                            k_val = float(tok)
+                                            break
+                                        except Exception:
+                                            continue
+                                    break
+                except Exception:
+                    k_val = None
+                entry = {
                     "center": float(center),
                     "pullf": str(pullf),
                     "pullx": str(pullx),
                     "tpr": str(tpr)
-                })
+                }
+                if k_val is not None:
+                    entry["k"] = float(k_val)
+                wins.append(entry)
 
         for zdir in sorted(windows_root.glob("z_*")):
             try:
-                m = re.match(r"z_([+-]?[0-9]+\.[0-9]+)", zdir.name)
+                m = re.match(r"z_([+-]?(?:\d+(?:\.\d+)?))$", zdir.name)
                 if not m:
                     continue
                 center = float(m.group(1))
@@ -2238,8 +2824,15 @@ pull-coord1-start       = yes
             pmf_dir = pmf_dir / f"replicate_{replicate}"
 
         pmf_dir.mkdir(parents=True, exist_ok=True)
+        # Expose replicate for topology selection and provenance
+        try:
+            self.replicate = int(replicate)
+        except Exception:
+            self.replicate = replicate
         self._setup_logging(pmf_dir)
         self.logger.info(f"PMF run started for {self.run_dir} -> {pmf_dir}")
+        # Reset QC cache for this run to avoid stale metrics across runs
+        self._window_qc_cache = {}
 
         # Get starting structure - try different locations
         equil_dir = self.run_dir / "equilibration"
@@ -2266,6 +2859,58 @@ pull-coord1-start       = yes
                 self.logger.error(f"  - {structure.relative_to(self.run_dir)}: {'✓' if structure.exists() else '✗'}")
             raise FileNotFoundError("No starting structure found")
 
+        # Estimate peptide footprint proxy (Rg_xy) from starting structure (nm)
+        peptide_rg_xy = None
+        try:
+            atoms0 = self.read_gro_atoms(start_structure)
+            pep_idx0 = self.find_peptide_indices(atoms0)
+            if pep_idx0:
+                xy = np.array([[x, y] for i, (_r,_a,x,y,_z) in enumerate(atoms0) if (i+1) in pep_idx0], dtype=float)
+                com = xy.mean(axis=0)
+                d2 = ((xy - com)**2).sum(axis=1)
+                peptide_rg_xy = float(np.sqrt(d2.mean())) if d2.size else None
+        except Exception:
+            peptide_rg_xy = None
+
+        # Expose Rg_xy to other writers
+        try:
+            self._peptide_rg_xy = float(peptide_rg_xy) if peptide_rg_xy is not None else None
+        except Exception:
+            self._peptide_rg_xy = None
+
+        # Size-aware reference & QC tuning
+        try:
+            rgxy = float(self._peptide_rg_xy) if getattr(self, '_peptide_rg_xy', None) is not None else 0.0
+        except Exception:
+            rgxy = 0.0
+        try:
+            a = float((self.umbrella_config.get('patch_radius_scale') or {}).get('a_nm', 0.5))
+            b = float((self.umbrella_config.get('patch_radius_scale') or {}).get('b_x', 1.2))
+            rmin = float(self.umbrella_config.get('patch_radius_min_nm', 2.0))
+            if bool(self.umbrella_config.get('patch_radius_auto', True)):
+                self.autopatch_radius_nm = max(rmin, a + b * rgxy)
+            else:
+                self.autopatch_radius_nm = float(self.umbrella_config.get('patch_radius', 2.5))
+            self.logger.info(f"Auto patch radius set to {self.autopatch_radius_nm:.2f} nm (Rg_xy={rgxy:.2f} nm)")
+        except Exception:
+            self.autopatch_radius_nm = float(self.umbrella_config.get('patch_radius', 2.5))
+        # Gentle QC bump in interface region for large peptides
+        try:
+            tun = (self.qc_config.get('size_tuning') or {})
+            rg_thr = float(tun.get('rgxy_threshold_nm', 1.6))
+            if rgxy >= rg_thr:
+                bump = float(tun.get('interface_overlap_bump', 0.02))
+                self.qc_config.setdefault('region_thresholds', {})
+                self.qc_config['region_thresholds'].setdefault('interface', {})
+                cur = float(self.qc_config['region_thresholds']['interface'].get('min_neighbor_overlap', 0.20))
+                self.qc_config['region_thresholds']['interface']['min_neighbor_overlap'] = max(cur, cur + bump)
+                self.logger.info(
+                    f"Bumped interface min_neighbor_overlap to "
+                    f"{self.qc_config['region_thresholds']['interface']['min_neighbor_overlap']:.2f} due to size"
+                )
+        except Exception:
+            pass
+
         # Calculate baseline window positions
         window_centers = self.calculate_window_positions()
         self.logger.info(f"Planning {len(window_centers)} umbrella windows")
@@ -2282,6 +2927,12 @@ pull-coord1-start       = yes
         # Create a single, consistent index for all windows (avoids reference bias)
         if self.consistent_reference:
             self.ensure_common_index(start_structure, pmf_dir)
+            # Preflight the common index and reference group to fail fast
+            try:
+                self._preflight_reference_index(start_structure, pmf_dir)
+            except Exception as e:
+                self.logger.error(f"Reference preflight failed: {e}")
+                raise
 
         # Fast paths
         if qc_only:
@@ -2291,6 +2942,10 @@ pull-coord1-start       = yes
                 self.logger.error("No existing windows found to analyze.")
                 raise SystemExit(2)
             qc_results = self.run_qc_checks(windows_data)
+            windows_selected, selection = self._filter_windows_by_qc(windows_data, pmf_dir)
+            qc_results = self._annotate_superseded_qc(qc_results, selection)
+            if windows_selected:
+                windows_data = windows_selected
             self.generate_qc_report(qc_results, pmf_dir)
             run_info = self.write_run_manifest(pmf_dir, [w['center'] for w in windows_data if w], qc_results)
             metadata = {
@@ -2303,10 +2958,13 @@ pull-coord1-start       = yes
                 "consistent_reference": bool(self.consistent_reference),
                 "reference_group": self.common_ref_group if self.common_ref_group else self.umbrella_config.get('ref_mode', 'patch'),
                 "index_file": str(Path(self.common_index_file).relative_to(self.run_dir)) if self.common_index_file else None,
-                "patch_radius": self.umbrella_config.get('patch_radius', 2.0),
+                "patch_radius": float(getattr(self, 'autopatch_radius_nm', self.umbrella_config.get('patch_radius', 2.0))),
                 "windows": windows_data,
-                "qc_results": qc_results
+                "qc_results": qc_results,
+                "peptide": ({"rg_xy_nm": float(peptide_rg_xy)} if peptide_rg_xy is not None else None)
             }
+            if selection:
+                metadata['qc_selection'] = selection
             with open(pmf_dir / "pmf_metadata.yaml", 'w') as f:
                 yaml.dump(metadata, f, default_flow_style=False)
             self.logger.info(f"QC + metadata written. Manifest: {run_info.name}")
@@ -2396,37 +3054,39 @@ pull-coord1-start       = yes
                 break
 
             to_add = []
-            # Add midpoint windows for low-overlap neighbors
-            for check in qc_results.get('overlap_check', []):
-                if not check.get('passed', False):
-                    mid = _round3(0.5*(check['windows'][0] + check['windows'][1]))
-                    if mid not in all_centers:
-                        to_add.append(mid)
-                        try:
-                            round_log["reasons"]["overlap_pairs"].append({
-                                "z1": float(check['windows'][0]),
-                                "z2": float(check['windows'][1]),
-                                "overlap": float(check.get('overlap', 0.0)),
-                                "min_required": float(check.get('min_required', 0.0)),
-                                "mid": float(mid),
-                            })
-                        except Exception:
-                            pass
-            # Add midpoint windows for large geometric gaps (safety)
-            k = float(self.umbrella_config.get('force_constant', 900))
-            dz_max = _dz_max_for_overlap(float(self.temperature_K), k, float(self.target_overlap))
-            all_centers_sorted = _dedup_sorted_centers([w['center'] for w in windows_data if w])
-            for a,b in zip(all_centers_sorted[:-1], all_centers_sorted[1:]):
-                if abs(a-b) > dz_max*1.05:
-                    mid = _round3(0.5*(a+b))
-                    if mid not in all_centers:
-                        to_add.append(mid)
-                        try:
-                            round_log["reasons"]["gaps"].append({
-                                "z1": float(a), "z2": float(b), "mid": float(mid), "dz": float(abs(a-b))
-                            })
-                        except Exception:
-                            pass
+            auto_densify = bool(self.umbrella_config.get('auto_densify', True))
+            if auto_densify:
+                # Add midpoint windows for low-overlap neighbors
+                for check in qc_results.get('overlap_check', []):
+                    if not check.get('passed', False):
+                        mid = _round3(0.5*(check['windows'][0] + check['windows'][1]))
+                        if mid not in all_centers:
+                            to_add.append(mid)
+                            try:
+                                round_log["reasons"]["overlap_pairs"].append({
+                                    "z1": float(check['windows'][0]),
+                                    "z2": float(check['windows'][1]),
+                                    "overlap": float(check.get('overlap', 0.0)),
+                                    "min_required": float(check.get('min_required', 0.0)),
+                                    "mid": float(mid),
+                                })
+                            except Exception:
+                                pass
+                # Add midpoint windows for large geometric gaps (safety)
+                k = float(self.umbrella_config.get('force_constant', 900))
+                dz_max = _dz_max_for_overlap(float(self.temperature_K), k, float(self.target_overlap))
+                all_centers_sorted = _dedup_sorted_centers([w['center'] for w in windows_data if w])
+                for a,b in zip(all_centers_sorted[:-1], all_centers_sorted[1:]):
+                    if abs(a-b) > dz_max*1.05:
+                        mid = _round3(0.5*(a+b))
+                        if mid not in all_centers:
+                            to_add.append(mid)
+                            try:
+                                round_log["reasons"]["gaps"].append({
+                                    "z1": float(a), "z2": float(b), "mid": float(mid), "dz": float(abs(a-b))
+                                })
+                            except Exception:
+                                pass
             to_add = _dedup_sorted_centers(to_add)
             # Respect max windows budget if configured
             try:
@@ -2499,9 +3159,10 @@ pull-coord1-start       = yes
                     pass
             # Re-check QC after fallback
             qc_results = self.run_qc_checks(windows_data)
-        self.generate_qc_report(qc_results, pmf_dir)
         # Select good replicates per center and update metadata payload
         windows_selected, selection = self._filter_windows_by_qc(windows_data, pmf_dir)
+        qc_results = self._annotate_superseded_qc(qc_results, selection)
+        self.generate_qc_report(qc_results, pmf_dir)
         if windows_selected:
             windows_data = windows_selected
         # Consistency validation
@@ -2516,14 +3177,15 @@ pull-coord1-start       = yes
             "n_windows": len(windows_data),
             "window_centers": [w['center'] for w in windows_data if w],
             "force_constant": self.umbrella_config.get('force_constant', 900),
-            "production_time": self.umbrella_config.get('production_ns', 20.0),
+            "production_time": self.umbrella_config.get('production_ns', 60.0),
             "reference_mode": self.umbrella_config.get('ref_mode', 'patch'),
             "consistent_reference": bool(self.consistent_reference),
             "reference_group": self.common_ref_group if self.common_ref_group else self.umbrella_config.get('ref_mode', 'patch'),
             "index_file": str(Path(self.common_index_file).relative_to(self.run_dir)) if self.common_index_file else None,
-            "patch_radius": self.umbrella_config.get('patch_radius', 2.0),
+                "patch_radius": float(getattr(self, 'autopatch_radius_nm', self.umbrella_config.get('patch_radius', 2.0))),
             "windows": windows_data,
-            "qc_results": qc_results
+            "qc_results": qc_results,
+            "peptide": ({"rg_xy_nm": float(peptide_rg_xy)} if peptide_rg_xy is not None else None)
         }
         # Persist selection summary for traceability
         if selection:
@@ -2533,9 +3195,20 @@ pull-coord1-start       = yes
         with open(metadata_file, 'w') as f:
             yaml.dump(metadata, f, default_flow_style=False)
 
-        # Final summary with more details
+        # Final summary with more details + completion gating
         successful_windows = len([w for w in windows_data if w])
-        self.logger.info("✅ PMF CALCULATION COMPLETED")
+        # Re-evaluate gates for final status
+        overlap_ok, ess_ok = self._qc_gates_passed(qc_results)
+        gate_cfg = (self.qc_config.get('completion_gate') or {})
+        try:
+            min_frac = float(gate_cfg.get('min_fraction', 0.6))
+        except Exception:
+            min_frac = 0.6
+        completion_ok = (successful_windows / max(1, len(window_centers)) >= min_frac) and overlap_ok and ess_ok
+        if completion_ok:
+            self.logger.info("✅ PMF CALCULATION COMPLETED")
+        else:
+            self.logger.warning("❌ PMF CALCULATION INCOMPLETE (coverage/QC gates not satisfied)")
         self.logger.info(f"  Peptide: {self.run_dir.name.split('_')[0]}")
         self.logger.info(f"  Replicate: {replicate}")
         self.logger.info(f"  Windows completed: {successful_windows}/{len(window_centers)}")
@@ -2550,8 +3223,11 @@ pull-coord1-start       = yes
         if successful_windows < len(window_centers):
             self.logger.warning(f"⚠ {len(window_centers) - successful_windows} windows failed")
             self.logger.warning("  Check the output for error messages")
-        self.logger.info("Next step: Run MBAR/WHAM analysis")
-        self.logger.info(f"Command: python scripts/analysis/pmf_mbar_analysis.py {pmf_dir}")
+        if completion_ok:
+            self.logger.info("Next step: Run MBAR analysis")
+            self.logger.info(f"Command: python scripts/analysis/pmf_mbar_analysis.py {pmf_dir}")
+        else:
+            self.logger.warning("Skip MBAR: insufficient coverage/QC. Inspect qc_report.yaml and logs.")
 
         return metadata
 
@@ -2564,11 +3240,15 @@ def main():
     parser.add_argument("--tag", help="Optional tag for output directory")
     parser.add_argument("--resume", action="store_true", help="Resume an incomplete run (skip existing windows)")
     parser.add_argument("--qc-only", action="store_true", help="Only generate qc_report.yaml + pmf_metadata.yaml from existing windows")
+    parser.add_argument("--preflight-only", action="store_true", help="Validate reference and plan windows; no MD")
     
     args = parser.parse_args()
     
     # Initialize runner
     runner = PMFRunner(args.run_dir)
+    if args.preflight_only:
+        runner.run_preflight(replicate=args.replicate, tag=args.tag)
+        return
     
     # Run PMF calculation
     runner.run_pmf_calculation(replicate=args.replicate, tag=args.tag, resume=args.resume, qc_only=args.qc_only)

@@ -11,7 +11,7 @@ SOLVIA ist eine **vollständig containerisierte** Pipeline zur Vorhersage der h�
 ## Pipeline-Architektur
 
 ```
-ColabFold → Martinize2 → INSANE → GROMACS → PMF/Umbrella → WHAM (Standard) / MBAR → Toxizitätsklassifikation
+ColabFold → Martinize2 → INSANE → GROMACS → PMF/Umbrella → MBAR (Standard) → Toxizitätsklassifikation
 ```
 
 ## Reproduzierbare Standard-Pipeline (empfohlen)
@@ -43,12 +43,32 @@ python3 scripts/universal/06_equilibrate.py simulations/solvia_1_run_1 --tag pmf
 python3 scripts/universal/08_run_pmf.py simulations/solvia_1_run_1 --replicate 1
 python3 scripts/universal/08_run_pmf.py simulations/solvia_1_run_1 --replicate 2
 
-# 7) Analyse (WHAM Standard, reproduzierbar ohne Bootstrap; Replikate aggregieren)
+# 7) Analyse (MBAR Standard; reproduzierbar ohne Bootstrap; Replikate aggregieren)
+# Ein Replikat/Tag analysieren
+python3 scripts/analysis/pmf_mbar_analysis.py \
+  simulations/solvia_1_run_1/pmf/pmf_midplane \
+  --no-bootstrap
+
+# Alternativ: Alle Replikate unter ${RUN_DIR}/pmf analysieren und aggregieren
 python3 scripts/analysis/pmf_mbar_analysis.py \
   simulations/solvia_1_run_1/pmf \
-  --method wham \
   --aggregate \
-  --no-bootstrap
+  --bootstrap 0
+
+# 8) HC50-Migration (2025-Felder in pmf_analysis_results.yaml ergänzen)
+# Scannt rekursiv unter ${RUN_DIR}/pmf und schreibt fehlende adsorption.kp/hc50-Felder
+# Mit RUN_DIR-Variable (aus obigen Schritten):
+python3 scripts/migrate_2025_hc50.py \
+  ${RUN_DIR}/pmf \
+  --write
+
+Hinweis: Der Aufruf sollte aus dem Repository‑Root erfolgen (damit das Modul
+`analysis.hc50` importiert werden kann). Das Migrationsskript setzt den Repo‑Root
+zwar automatisch auf den Python‑Pfad, aber am sichersten ist:
+
+# im Repo‑Root ausführen
+cd /home/michelhuller/solvia
+python3 scripts/migrate_2025_hc50.py ${RUN_DIR}/pmf --write
 
 ### Optional: Regionale QC-Schwellen und Auto-Stride
 
@@ -89,7 +109,7 @@ pmf:
 Hinweise:
 - Membran: validierte RBC-Asymmetrie mit ~42% CHOL ist per Default aktiv; Leaflets werden per Index (`index_leaflets.ndx`) definiert.
 - PMF: 60 ns/Fenster; QC/Auto‑Densify/Extend gemäß `config/pmf_standard_config.yaml`.
-- Analyse: WHAM ist robust und deterministisch (ohne Bootstrap). MBAR optional (`--method mbar`).
+- Analyse: MBAR ist Standard; deterministisch mit `--no-bootstrap`. Bootstrap optional (z. B. `--bootstrap 100`).
 - Reproduzierbarkeit: Seeds für Replikate sind deterministisch; Bootstrap ist per Default deaktiviert.
 
 ## Voraussetzungen
@@ -121,7 +141,7 @@ python3 scripts/universal/01_setup_run.py data/raw/fasta/SOLVIA_1.fasta
 
 ```bash
 # Variable für Run-Verzeichnis
-RUN_DIR="simulations/solvia_32_run_1"
+RUN_DIR="simulations/solvia_68_run_2"
 
 # ColabFold für Strukturvorhersage
 docker compose run --rm \
@@ -310,7 +330,7 @@ gmx mdrun -v -deffnm npt
 # Enhanced PMF mit lokaler Midplane-Referenz
 python3 scripts/universal/08_run_pmf.py ${RUN_DIR} \
   --replicate 1 \
-  --tag pmf_midplane
+  --tag pmf_midplane \
   --resume
 
 # Für mehrere Replikate:
@@ -321,9 +341,10 @@ for REP in 1 2 3; do
 done
 
 # Features:
-# - Lokale Midplane-Referenz (balancierte Outer/Inner PO4, ~2.5 nm Radius)
+# - Lokale Midplane-Referenz (balancierte Outer/Inner PO4, ~2.5 nm Radius; pbcatom=COM)
 # - Adaptive Fenster-Verdichtung
 # - SMD-Initialisierung
+# - Optionale kurze Pre‑Equilibration am Ziel‑z (pre_equil_ns)
 # - Automatische QC-Gates
 # - Logging (run.log), Resume & QC-only
 ```
@@ -356,25 +377,23 @@ python3 scripts/universal/08_run_pmf.py ${RUN_DIR} \
 # Outputs (pro Tag/Replicate):
 # ${RUN_DIR}/pmf/<tag>/run.log         # Laufprotokoll
 # ${RUN_DIR}/pmf/<tag>/qc_report.yaml  # QC-Zusammenfassung
-# ${RUN_DIR}/pmf/<tag>/pmf_metadata.yaml  # Metadaten für Analyse
+# ${RUN_DIR}/pmf/<tag>/pmf_metadata.yaml  # Metadaten für Analyse (inkl. windows[].k)
 # ${RUN_DIR}/pmf/<tag>/RUN_INFO.yaml   # Provenienz (Git, Container, Env)
 ```
 
-## Schritt 7: PMF-Analyse mit WHAM/MBAR
+## Schritt 7: PMF-Analyse mit MBAR
 
-### 7.1 WHAM (Standard) und MBAR (optional)
+### 7.1 MBAR (Standard)
 
 ```bash
 # Analyse für jedes Replikat
 python3 scripts/analysis/pmf_mbar_analysis.py \
   ${RUN_DIR}/pmf/pmf_midplane \
-  --method wham \
   --no-bootstrap 
 
 python3 scripts/analysis/pmf_mbar_analysis.py \
   ${RUN_DIR}/pmf/pmf_midplane \
-  --method mbar \
-  --no-bootstrap
+  --bootstrap 100
 
 # Output:
 # - pmf_analysis_results.yaml    # Features & Metriken
@@ -382,13 +401,16 @@ python3 scripts/analysis/pmf_mbar_analysis.py \
 #   ├── pmf_profile.png          # PMF mit 95% CI
 #   ├── overlap_matrix.png       # Window-Overlap
 #   └── convergence.png          # Konvergenz-Check
+# Zusatz (vergleichbar zwischen Peptiden):
+# - adsorption.peptide_area_nm2 (falls konfiguriert/ableitbar)
+# - adsorption.theta_at_1uM, adsorption.theta_at_hc50
+# - optional: adsorption.hc50_uM_at_theta_star (bei konfiguriertem theta_star)
 ```
 
 ```bash
 # Alternativ: Alle Replikate unter ${RUN_DIR}/pmf analysieren und aggregieren
 python3 scripts/analysis/pmf_mbar_analysis.py \
   ${RUN_DIR}/pmf \
-  --method mbar \
   --aggregate \
   --bootstrap 0
 
@@ -531,23 +553,37 @@ python3 scripts/analysis/compare_replicates.py ${RUN_DIR}/pmf
 
 ### Zentrale PMF-Konfiguration
 ```yaml
-# config/pmf_standard_config.yaml
+# config/pmf_standard_config.yaml (Auszug)
+
+Hinweis: HC50 wird ausschließlich aus der Adsorptions‑Thermodynamik (Wasserseite) abgeleitet. ΔG_insert ist optional/diagnostisch und fließt nicht in die Klassifikation ein. Details siehe docs/README_HC50.md.
+
+### CSV‑Export (HC50/Kp Übersicht)
+
+```bash
+python scripts/analysis/export_results_csv.py simulations -o out/results.csv
+```
+Spalten: `peptide,replicate,kp_nm,kp_eff_nm,hc50_low_uM,hc50_high_uM,delta_g_ads,z_ads,label,qc_pass,path`.
 pmf:
   umbrella:
-    ref_mode: "midplane_local"   # Lokale Midplane-Referenz (balancierte Outer/Inner PO4)
-    patch_radius: 2.5      # nm (Radius für lokale Patch-Selektion)
-    force_constant: 900    # kJ/mol/nm²
-    production_ns: 20.0
-    lipid_z_posres: false  # keine Lipid-Z-Restraints in Produktion
+    ref_mode: "hybrid"            # LocalMidplane → LocalPatch → UpperPO4 (Fallback)
+    consistent_reference: true     # ein gemeinsamer Index für alle Fenster
+    patch_radius: 2.5              # nm
+    pre_smd_ns: 1.0                # kurzer SMD‑Nudge
+    pre_equil_ns: 1.0              # kurzer Vorlauf am Ziel‑z (optional)
+    force_constant: 900            # kJ/mol/nm²
+    production_ns: 60.0
+    lipid_z_posres: false
   qc:
-    min_neighbor_overlap: 0.10
+    min_neighbor_overlap: 0.15
     target_overlap: 0.20
     min_ess_frames: 100
-    ess_stride: 5
-    max_extend_ns: 40.0
-  umbrella:
-    z_range:
-      dense_step: 0.10
+    ess_stride: "auto"
+    max_extend_ns: 80.0
+    region_thresholds:
+      interface:
+        min_ess_frames: 300
+  analysis:
+    method: "mbar"                # MBAR ist Standard
 ```
 
 ## Wissenschaftliche Referenzen

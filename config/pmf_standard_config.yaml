@@ -7,7 +7,7 @@ pmf:
     c_terminal: NH2-ter
     force_field: martini3001
     force_field_auto: true
-    elastic_network: true
+    elastic_network: false
     validation:
       clash_frac_max: 0.02
       bb_dist_min_nm: 0.20
@@ -52,8 +52,13 @@ pmf:
   umbrella:
     # Reference mode
     ref_mode: "hybrid"          # midplane_local | patch | hybrid | global | plumed
-    consistent_reference: true   # Use the same reference group across all windows
+    consistent_reference: false  # Allow auto-switch between patch and global references
     patch_radius: 2.5  # nm around peptide COM (used for local patch selection)
+    patch_radius_auto: true      # auto-scale patch by peptide size (Rg_xy)
+    patch_radius_min_nm: 2.0
+    patch_radius_scale:
+      a_nm: 0.5                  # radius = max(min, a + b*Rg_xy)
+      b_x: 1.2
     pbc_type: orthorhombic       # orthorhombic | triclinic (triclinic tries MDAnalysis)
     lipid_z_posres: false  # Do NOT restrain lipids in production PMF windows
     use_previous_frame: true   # Chain windows: use previous window's final structure
@@ -68,16 +73,16 @@ pmf:
       k_max: 5000.0
     
     # Explicit evidence-based one-sided window list (+3.0 → 0.0 nm)
-    window_centers: [3.0, 2.8, 2.6, 2.4, 2.2,
+    window_centers: [3.0, 2.9, 2.8, 2.7, 2.6, 2.5, 2.4, 2.3, 2.2, 2.1, 
                      2.0, 1.9, 1.8, 1.7, 1.6, 1.5, 1.4, 1.3, 1.2,
                      1.15, 1.10, 1.05, 1.00, 0.95, 0.90, 0.85, 0.80,
                      0.70, 0.60, 0.50, 0.40, 0.30, 0.20, 0.10, 0.05, 0.00]
     
     # Timing (SMD prep + production)
     smd_prepare: true         # Do a short SMD nudge toward target z
-    pre_smd_ns: 1.0           # Short but effective SMD (raised from 0.5)
+    pre_smd_ns: 2.0           # Short but effective SMD (raised from 0.5)
     smd_max_ns: 2.0           # Safety cap for SMD duration
-    smd_max_rate_nm_per_ns: 2.0  # Max pull rate during SMD (nm/ns)
+    smd_max_rate_nm_per_ns: 1.5  # Max pull rate during SMD (nm/ns)
     smd_force_constant: 800      # kJ/mol/nm^2 for SMD nudge
     pre_equil_ns: 5.0         # Pre-equilibration per window
     production_ns: 60.0       # Default per-window production time (ns)
@@ -114,7 +119,7 @@ pmf:
     replicate_tolerance: 2.0     # kJ/mol for ΔGads, ΔGinsert
     
     # Maximum resources
-    max_windows: 32              # Budget limit
+    max_windows: 45              # Budget limit (allows densify headroom)
     max_time_per_window: 120      # ns
 
     # QC rounds and adaptation
@@ -123,7 +128,7 @@ pmf:
     auto_extend: true         # automatically extend windows on QC fail
     extend_ns: 10.0           # per-iteration extension (ns)
     max_extend_ns: 80.0       # cap per window extension (ns)
-    discard_fraction: 0.10    # discard initial fraction for QC (ESS/half-energy)
+    discard_fraction: 0.20    # discard initial fraction for QC (ESS/half-energy)
     ess_stride: "auto"        # automatic stride for ESS estimation (or integer ≥1)
     filter:                  # drop bad replicates per center before analysis
       enabled: true
@@ -131,11 +136,12 @@ pmf:
       drop_if_drift_fail: false
       min_ess_keep: 20       # keep replicate only if ESS >= this
       min_keep_per_center: 1 # always keep at least the best replicate
+      max_keep_per_center: 1 # cap survivors per center (1 = single best)
       keep_best_if_all_filtered: true
-      prefer_by: ess         # ess | half_then_ess
+      prefer_by: half_then_ess
     fallback:                 # Fallback if QC gates still fail after rounds
       enabled: true
-      min_ess_trigger: 50     # replicate windows with ESS < this
+      min_ess_trigger: 200    # replicate windows with ESS < this
       replicate_count: 3      # N independent replicates per target window
       per_replicate_ns: 50.0  # production per replicate (ns)
       k_tune_scale: 1.2       # multiply k for these tough windows (e.g., 1.2x)
@@ -148,24 +154,30 @@ pmf:
         min_neighbor_overlap: 0.12
         min_ess_frames: 150
         half_energy_tol_kj: 3.0
-        half_z_tol_sigma: 2.5
+        half_z_tol_sigma: 3.5
         min_time_ns: 20
       approach:
         min_neighbor_overlap: 0.15
         min_ess_frames: 200
         half_energy_tol_kj: 2.0
-        half_z_tol_sigma: 2.0
+        half_z_tol_sigma: 3.0
         min_time_ns: 30
       interface:
         min_neighbor_overlap: 0.20
-        min_ess_frames: 150
+        min_ess_frames: 300
         half_energy_tol_kj: 1.0
-        half_z_tol_sigma: 1.5
+        half_z_tol_sigma: 1.8
         min_time_ns: 40
+    # Size-aware tuning for large peptides
+    size_tuning:
+      rgxy_threshold_nm: 1.6
+      interface_overlap_bump: 0.02
   
   # Analysis parameters
   analysis:
-    method: "wham"               # Primary method (wham | mbar)
+    method: "mbar"               # Primary method (mbar)
+    simulation:
+      temperature: 310.0
     # Adsorption (HC50) windowing — reproducible defaults
     adsorption:
       window_mode: energy_band       # energy_band | pmf_negative | around_min | fixed
@@ -186,37 +198,42 @@ pmf:
       # Physical parameters for HC50 calculation
       area_per_lipid_nm2: 0.62
       lp_star_range: [154, 515]
-      bilayer_factor: 1.0            # one-sided PMF evaluation (set 2.0 only for bilateral adsorption)
+      bilayer_factor: 2.0            # standard: normalize to bilayer (both leaflets)
+      # Size-aware L/P* (disabled by default; leave fixed)
+      lp_star_mode: fixed            # auto_from_footprint | fixed
+      pack_factor: 1.0                    # packing correction (0.8–1.2 reasonable)
+      footprint:
+        mode: convex_hull
+        contact_fraction: 0.4            # lowest fraction in z used as contact face
+        windows_max: 4                   # average over up to this many windows in [z_low, z_high]
+        fallback_rgxy: true              # if hull degenerate/missing, use π·Rg_xy²
     mbar:
       fallback_policy: numeric_only   # numeric_only | strict | never
       max_samples: 2000000            # large cap; prefer decorrelation over hard thinning
+      max_elements: 30000000          # cap total u_kn elements (n_states * samples)
       pmf_range_kj: 200.0             # used if fallback_policy=strict
       pmf_min_kj: -100.0              # used if fallback_policy=strict
+      max_iterations: 5000
+      relative_tolerance: 1.0e-7
     bootstrap:
       enabled: true
-      n_bootstrap: 100
+      n_bootstrap: 200
       method: block             # standard | block (ESS-based moving blocks)
       confidence_level: 0.95
+    bootstrap_thin: 5
     bulk_detection:
       enabled: true
       mode: auto                # auto | fixed_z | percentile
       z_min_nm: 2.4             # used if mode=fixed_z
       top_percent: 10.0         # used if mode=percentile
       grad_kj_per_nm: 2.0       # slope threshold to detect plateau region
-      min_bins: 50
+      min_bins: 10
     plot:
       min_bin_count_for_ci: 25  # draw CI only where count per bin >= this
-      pmf_min_bin_count: 25     # MBAR/WHAM: trim to contiguous bins with at least this many counts
+      pmf_min_bin_count: 25     # MBAR: trim to contiguous bins with at least this many counts
       ci_min_bootstrap_fraction: 0.90  # require at least 90% finite bootstrap support to draw CI
       ci_max_band_kj: 200.0            # hide CI where 95% band exceeds this height (kJ/mol)
-    wham:
-      use_ess_weighting: true
-      convergence_kj: 0.2        # stop adaptive refinement when change < eps (kJ/mol)
-      min_counts_refine: 20      # only refine between bins with >= this many total counts
-      adaptive_grid:
-        enabled: true
-        slope_kj_per_nm: 50.0
-        max_refine_passes: 1
+    # WHAM configuration removed (MBAR-only analysis)
     preprocess:
       subsample_uncorrelated: true  # use timeseries.detectEquilibration + subsample
     symmetrize: false           # optional, for membrane-symmetric reporting
@@ -224,6 +241,10 @@ pmf:
     feature_params:
       ads_max_z: 2.0            # nm, upper bound for adsorption search
       insert_min_z: -1.5        # nm, lower bound for insertion search
+    classification:
+      rules:
+        use_hc50: true
+        hc50_cutoffs_uM: [50.0, 200.0]
     # Additional analysis-level QC
     qc:
       strict_mode: false            # if true, fail run when thresholds violated

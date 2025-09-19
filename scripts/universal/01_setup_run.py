@@ -88,7 +88,6 @@ def create_directory_structure(run_dir):
         "equilibration/nvt", 
         "equilibration/npt",
         "pmf",
-        "analysis",
         "logs"
     ]
     
@@ -124,6 +123,37 @@ Created: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
     with open(os.path.join(run_dir, "README.md"), 'w') as f:
         f.write(readme_content)
 
+def copy_membrane_template(run_dir: str):
+    """Copy membrane template files into run's membrane_template directory."""
+    project_root = Path(__file__).parent.parent.parent
+    src_dir = project_root / 'data' / 'templates' / 'membrane'
+    dst_dir = Path(run_dir) / 'membrane_template'
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    if not src_dir.exists():
+        print(f"Warning: membrane template directory not found: {src_dir}")
+        return
+    copied = 0
+    for entry in sorted(src_dir.iterdir()):
+        try:
+            if entry.is_file():
+                shutil.copy2(entry, dst_dir / entry.name)
+                copied += 1
+            elif entry.is_dir():
+                target = dst_dir / entry.name
+                if target.exists():
+                    # Skip existing directories to avoid overwriting user edits
+                    continue
+                try:
+                    shutil.copytree(entry, target)
+                    copied += 1
+                except TypeError:
+                    # Python without dirs_exist_ok: best effort copy
+                    shutil.copytree(entry, target)
+                    copied += 1
+        except Exception as e:
+            print(f"  Warning: could not copy {entry.name}: {e}")
+    print(f"✓ Copied {copied} membrane template item(s) to {dst_dir}")
+
 def setup_run(fasta_file, force=False):
     """Main setup function"""
     # Load configuration
@@ -147,6 +177,8 @@ def setup_run(fasta_file, force=False):
     # Create directory structure
     print(f"Setting up run: {run_name}")
     create_directory_structure(run_dir)
+    # Copy membrane template files into the run folder
+    copy_membrane_template(run_dir)
     
     # Copy input FASTA
     input_dir = os.path.join(run_dir, "input")

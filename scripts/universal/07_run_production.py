@@ -139,8 +139,11 @@ def run_production(run_dir, occupancy="low", time_ns=None, gpu=True, tag: str | 
     rel_tpr = os.path.relpath(tpr_file, project_root)
     rel_cpt = os.path.relpath(npt_cpt, project_root)
     
+    # Ensure emergency files (e.g., step*.pdb) land in production dir
+    rel_prod_dir = os.path.relpath(prod_dir, project_root)
+    container_wd = f"/work/{rel_prod_dir}"
     cmd = [
-        "docker", "compose", "run", "--rm", "gromacs",
+        "docker", "compose", "run", "--rm", "--workdir", container_wd, "gromacs",
         "grompp",  # Docker already provides "gmx"
         "-f", f"/work/{rel_mdp}",
         "-c", f"/work/{rel_npt}",
@@ -160,7 +163,7 @@ def run_production(run_dir, occupancy="low", time_ns=None, gpu=True, tag: str | 
     rel_deffnm = os.path.relpath(os.path.join(prod_dir, "production"), project_root)
     
     mdrun_cmd = [
-        "docker", "compose", "run", "--rm", "gromacs",
+        "docker", "compose", "run", "--rm", "--workdir", container_wd, "gromacs",
         "mdrun",  # Docker already provides "gmx"
         "-v",
         "-deffnm", f"/work/{rel_deffnm}"
