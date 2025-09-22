@@ -45,6 +45,7 @@ logs/
 data/intermediate/
 data/output/
 colabfold_cache/
+.cache/
 
 # Simulations and large generated artifacts
 simulations/
