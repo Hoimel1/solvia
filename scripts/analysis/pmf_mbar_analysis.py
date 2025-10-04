@@ -18,6 +18,7 @@ except Exception:
     pass
 import matplotlib.pyplot as plt
 from matplotlib.patches import Polygon
+from cycler import cycler
 from pathlib import Path
 import argparse
 from scipy.interpolate import PchipInterpolator
@@ -25,16 +26,65 @@ from scipy import integrate
 import math
 from scipy.special import logsumexp
 from scipy.spatial import ConvexHull
-try:
-    # New HC50 module (adsorption-only thermodynamics)
-    from analysis.hc50 import (
-        AdsorptionParams, compute_kp_ads_nm, compute_hc50_uM_from_kp,
-    )
-except Exception:
-    AdsorptionParams = None
-    compute_kp_ads_nm = None
-    compute_hc50_uM_from_kp = None
 
+ROOT_DIR = Path(__file__).resolve().parents[2]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+try:
+    from scripts.features import compute_sequence_descriptors
+except ImportError:  # pragma: no cover - fallback for direct execution
+    from features import compute_sequence_descriptors  # type: ignore
+
+PUBLICATION_STYLE = {
+    "font.family": "sans-serif",
+    "font.sans-serif": ["Arial", "DejaVu Sans"],
+    "font.size": 12,
+    "axes.titlesize": 14,
+    "axes.labelsize": 13,
+    "axes.linewidth": 1.2,
+    "axes.grid": False,
+    "grid.alpha": 0.2,
+    "xtick.direction": "out",
+    "ytick.direction": "out",
+    "xtick.major.size": 5.5,
+    "ytick.major.size": 5.5,
+    "xtick.major.width": 1.0,
+    "ytick.major.width": 1.0,
+    "legend.frameon": False,
+    "legend.fontsize": 11,
+    "figure.dpi": 120,
+    "savefig.dpi": 300,
+    "savefig.bbox": "tight",
+}
+
+matplotlib.rcParams.update(PUBLICATION_STYLE)
+plt.rcParams["axes.prop_cycle"] = cycler(color=[
+    "#1f77b4", "#d62728", "#2ca02c", "#9467bd",
+    "#ff7f0e", "#17becf", "#8c564b", "#bcbd22",
+])
+
+
+def _format_publication_axes(ax):
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.tick_params(axis='both', which='both', direction='out', length=5.0, width=1.0)
+    ax.grid(False)
+
+
+def _load_rank_gamma_params():
+    path = Path(__file__).parent.parent.parent / "config" / "hc50_rank_model.yaml"
+    if not path.exists():
+        return None, None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+    except Exception:
+        return None, None
+    return data.get("rank_model"), data.get("gamma_model")
+
+
+RANK_MODEL_PARAMS, GAMMA_MODEL_PARAMS = _load_rank_gamma_params()
 # Try to import pymbar
 try:
     import pymbar
@@ -52,6 +102,8 @@ class PMFAnalyzer:
         
         # Stash provided config (final config is set after metadata load)
         self.config = config if config is not None else {}
+        self.rank_model_params = RANK_MODEL_PARAMS
+        self.gamma_model_params = GAMMA_MODEL_PARAMS
         # Try different locations for metadata file
         possible_metadata_files = []
         
@@ -167,6 +219,18 @@ class PMFAnalyzer:
         # QC/validation defaults
         qc_cfg = (self.config.get('qc') or {})
         self.ergodicity_block_r_max = float(qc_cfg.get('ergodicity_block_r_max', 0.2))
+
+        self.cg_footprint_nm2 = None
+        self.cg_sequence_length = None
+        self.cg_rg_xy_nm = None
+        self._load_coarse_grain_properties()
+        if self.cg_sequence_length is not None:
+            self.metadata.setdefault('peptide', {})['sequence_length'] = self.cg_sequence_length
+
+        self.peptide_sequence = None
+        self.sequence_descriptors: dict[str, float] = {}
+        self.peptide_id = None
+        self._load_sequence_info()
         
     def load_analysis_config(self):
         """Load PMF analysis configuration"""
@@ -176,6 +240,91 @@ class PMFAnalyzer:
                 config = yaml.safe_load(f)
                 return config.get('pmf', {}).get('analysis', {})
         return {}
+
+    def _get_run_root(self) -> Path:
+        path = self.pmf_dir
+        if path.name.startswith("pmf_"):
+            path = path.parent
+        if path.name == "pmf":
+            path = path.parent
+        return path
+
+    @staticmethod
+    def _read_sequence_from_fasta(path: Path) -> tuple[str | None, str | None]:
+        seq_lines = []
+        header_id = None
+        try:
+            with path.open('r', encoding='utf-8') as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    if line.startswith('>'):
+                        if header_id is None:
+                            header_id = line[1:].split()[0]
+                        # Only keep first sequence for PMF runs
+                        if seq_lines:
+                            break
+                        continue
+                    seq_lines.append(line)
+        except Exception:
+            return None, None
+        sequence = ''.join(seq_lines).upper() if seq_lines else None
+        return sequence or None, header_id
+
+    def _load_sequence_info(self) -> None:
+        try:
+            run_root = self._get_run_root()
+        except Exception:
+            return
+
+        metadata_path = run_root / "metadata.yaml"
+        meta = {}
+        if metadata_path.exists():
+            try:
+                with metadata_path.open('r', encoding='utf-8') as handle:
+                    meta = yaml.safe_load(handle) or {}
+            except Exception:
+                meta = {}
+
+        self.peptide_id = meta.get('peptide_id') or meta.get('peptide')
+
+        fasta_candidates = []
+        fasta_name = meta.get('fasta_file')
+        if fasta_name:
+            fasta_candidates.append(run_root / 'input' / fasta_name)
+            fasta_candidates.append(run_root / fasta_name)
+        fasta_candidates.extend([
+            run_root / 'input' / 'peptide.fasta',
+            run_root / 'input' / 'peptide.fa',
+            run_root / 'input' / 'peptide.faa',
+        ])
+        try:
+            fasta_candidates.extend(sorted(run_root.glob('input/*.fa*')))
+        except Exception:
+            pass
+
+        sequence = None
+        header_id = None
+        for cand in fasta_candidates:
+            if cand.exists():
+                sequence, header_id = self._read_sequence_from_fasta(cand)
+                if sequence:
+                    break
+
+        if sequence:
+            if not self.peptide_id:
+                self.peptide_id = header_id
+            self.peptide_sequence = sequence
+            try:
+                self.sequence_descriptors = compute_sequence_descriptors(sequence)
+            except Exception as exc:
+                print(f"Warning: failed to compute sequence descriptors for {self.pmf_dir}: {exc}")
+                self.sequence_descriptors = {}
+            self.metadata.setdefault('peptide', {})['sequence'] = sequence
+            self.metadata.setdefault('peptide', {})['sequence_length'] = len(sequence)
+            if self.peptide_id:
+                self.metadata.setdefault('peptide', {})['id'] = self.peptide_id
 
     # =========================
     # Helper utilities (analysis)
@@ -207,6 +356,51 @@ class PMFAnalyzer:
         return np.array(xy, dtype=float) if xy else np.zeros((0, 3), float)
 
     @staticmethod
+    def _read_gro_all(gro_path: Path) -> tuple[np.ndarray, int]:
+        coords = []
+        residues = []
+        try:
+            with open(gro_path, "r") as f:
+                lines = f.readlines()
+        except Exception:
+            return np.zeros((0, 3), float), 0
+        for ln in lines[2:-1]:
+            try:
+                resid = int(ln[:5])
+                x = float(ln[20:28]); y = float(ln[28:36]); z = float(ln[36:44])
+            except Exception:
+                continue
+            coords.append((x, y, z))
+            residues.append(resid)
+        coords = np.array(coords, dtype=float) if coords else np.zeros((0, 3), float)
+        seq_len = len(set(residues)) if residues else 0
+        return coords, seq_len
+
+    @staticmethod
+    def _read_pdb_all(pdb_path: Path) -> tuple[np.ndarray, int]:
+        coords = []
+        residues = []
+        try:
+            with open(pdb_path, "r") as f:
+                for line in f:
+                    if not line.startswith(("ATOM", "HETATM")):
+                        continue
+                    try:
+                        resid = int(line[22:26])
+                        x = float(line[30:38]) / 10.0
+                        y = float(line[38:46]) / 10.0
+                        z = float(line[46:54]) / 10.0
+                    except Exception:
+                        continue
+                    coords.append((x, y, z))
+                    residues.append(resid)
+        except Exception:
+            return np.zeros((0, 3), float), 0
+        coords = np.array(coords, dtype=float) if coords else np.zeros((0, 3), float)
+        seq_len = len(set(residues)) if residues else 0
+        return coords, seq_len
+
+    @staticmethod
     def _rg_xy_nm2(xyz: np.ndarray) -> float:
         if xyz is None or xyz.size == 0:
             return 0.0
@@ -227,6 +421,142 @@ class PMFAnalyzer:
             return float(A) if A is not None else 0.0
         except Exception:
             return 0.0
+
+    def _load_coarse_grain_properties(self) -> None:
+        try:
+            base_dir = self.pmf_dir.parent.parent
+            cg_dir = base_dir / "coarse_grain"
+            candidates = []
+            if cg_dir.exists():
+                candidates.extend(sorted(cg_dir.glob("*_cg.gro")))
+                candidates.extend(sorted(cg_dir.glob("peptide_cg.gro")))
+                candidates.extend(sorted(cg_dir.glob("*_cg.pdb")))
+                candidates.extend(sorted(cg_dir.glob("peptide_cg.pdb")))
+            for path in candidates:
+                if not path.exists():
+                    continue
+                if path.suffix.lower() == ".gro":
+                    coords, seq_len = self._read_gro_all(path)
+                else:
+                    coords, seq_len = self._read_pdb_all(path)
+                if coords.size == 0:
+                    continue
+                xy = coords[:, :2]
+                area = self._hull_area_nm2(xy)
+                if area <= 0.0:
+                    com = xy.mean(axis=0)
+                    rg = np.sqrt(((xy - com) ** 2).sum(axis=1).mean())
+                    area = math.pi * rg ** 2
+                if area <= 0.0:
+                    continue
+                self.cg_footprint_nm2 = float(area)
+                self.cg_sequence_length = int(seq_len) if seq_len else None
+                xy = coords[:, :2]
+                com = xy.mean(axis=0)
+                self.cg_rg_xy_nm = float(np.sqrt(((xy - com) ** 2).sum(axis=1).mean()))
+                return
+        except Exception:
+            self.cg_footprint_nm2 = None
+            self.cg_sequence_length = None
+            self.cg_rg_xy_nm = None
+
+    def _apply_rank_model(self, features: dict, adsorption: dict, ess_mean: Optional[float] = None):
+        params = self.rank_model_params
+        if not params:
+            return
+        try:
+            feature_names = params.get('feature_names') or []
+            weights = np.asarray(params.get('weights'), dtype=float)
+            means = np.asarray(params.get('means'), dtype=float)
+            stds = np.asarray(params.get('stds'), dtype=float)
+            iso_x = np.asarray(params.get('isotonic_x'), dtype=float)
+            iso_y = np.asarray(params.get('isotonic_y'), dtype=float)
+            if not feature_names or weights.size == 0 or iso_x.size == 0 or iso_y.size == 0:
+                return
+        except Exception:
+            return
+
+        gamma_params = self.gamma_model_params or {}
+        alpha = gamma_params.get('alpha')
+        beta = gamma_params.get('beta')
+
+        def _safe_log10(value: Optional[float]) -> float:
+            if value is None or not np.isfinite(value) or value <= 0:
+                return 0.0
+            return float(np.log10(value))
+
+        values = []
+        for idx, name in enumerate(feature_names):
+            if name == 'delta_g':
+                val = features.get('delta_g_ads')
+            elif name == 'log_kp':
+                kp = adsorption.get('kp_eff_nm')
+                val = _safe_log10(kp)
+            elif name == 'log_gamma_model':
+                delta_g = features.get('delta_g_ads')
+                gamma_model = None
+                if alpha is not None and beta is not None and delta_g is not None:
+                    gamma_model = float(np.exp(alpha * float(delta_g) + beta))
+                elif adsorption.get('Gamma_star_model') is not None:
+                    gamma_model = float(adsorption.get('Gamma_star_model'))
+                if gamma_model is None or not np.isfinite(gamma_model) or gamma_model <= 0:
+                    gamma_model = 1e-6
+                features['Gamma_star_model'] = gamma_model
+                val = _safe_log10(gamma_model)
+            elif name == 'log_lp_model':
+                gamma_model = features.get('Gamma_star_model')
+                area_per_lipid = adsorption.get('area_per_lipid_nm2') or 0.62
+                lp_model = None
+                if gamma_model and np.isfinite(gamma_model) and gamma_model > 0:
+                    lp_model = 1.0 / (area_per_lipid * float(gamma_model))
+                if lp_model is None or not np.isfinite(lp_model) or lp_model <= 0:
+                    lp_model = 1.0
+                adsorption['LP_star_model'] = lp_model
+                val = _safe_log10(lp_model)
+            elif name == 'log_theta':
+                theta = adsorption.get('theta_at_1uM')
+                if theta is None or not np.isfinite(theta) or theta <= 0:
+                    theta = 1e-6
+                val = _safe_log10(theta)
+            elif name == 'log_seq_len':
+                seq_len = features.get('sequence_length') or features.get('sequence_length_cg')
+                if seq_len is None:
+                    seq_len = (self.metadata.get('peptide') or {}).get('sequence_length')
+                if not seq_len or not np.isfinite(seq_len) or seq_len <= 0:
+                    seq_len = 1.0
+                features.setdefault('sequence_length', float(seq_len))
+                val = _safe_log10(seq_len)
+            elif name == 'qc_frac':
+                val = 1.0
+            elif name == 'ess_mean':
+                val = ess_mean if ess_mean is not None else 100.0
+            else:
+                val = 0.0
+
+            if val is None or not np.isfinite(val):
+                val = means[idx] if idx < len(means) else 0.0
+            values.append(float(val))
+
+        if len(values) != weights.size:
+            return
+
+        values = np.asarray(values, dtype=float)
+        stds = np.where(stds <= 0, 1.0, stds)
+        standardized = (values - means) / stds
+        score = float(np.dot(weights, standardized))
+
+        hc50_log10 = float(np.interp(score, iso_x, iso_y, left=iso_y[0], right=iso_y[-1]))
+        hc50_uM = float(10 ** hc50_log10)
+
+        features['hc50_rank_score'] = score
+        features['hc50_rank_log10'] = hc50_log10
+        features['hc50_rank_uM'] = hc50_uM
+        adsorption['hc50_rank_uM'] = hc50_uM
+
+        if 'Gamma_star_model' in features:
+            adsorption.setdefault('Gamma_star_model', features['Gamma_star_model'])
+        if 'LP_star_model' in adsorption:
+            features['LP_star_model'] = adsorption['LP_star_model']
 
     def _estimate_footprint_from_windows(self, z_low: float, z_high: float,
                                           contact_fraction: float = 0.4,
@@ -338,7 +668,8 @@ class PMFAnalyzer:
                     A = math.pi * self._rg_xy_nm2(xyz)
                     ax.text(0.02, 0.98, f"A≈π·Rg_xy²={float(A):.2f} nm²", transform=ax.transAxes, va="top")
                 ax.set_aspect('equal', adjustable='datalim')
-                ax.grid(alpha=0.25)
+                ax.grid(False)
+                _format_publication_axes(ax)
 
             # Hide unused axes
             for j in range(len(sel), len(axes)):
@@ -563,7 +894,26 @@ class PMFAnalyzer:
                 if abs(z[j] + zi) <= tol:
                     y_sym[i] = y_sym[j] = 0.5 * (y[i] + y[j])
         return y_sym
-    
+
+    def _thin_series_random(self, series: np.ndarray, factor: int) -> np.ndarray:
+        """Randomly subsample a time series by approximately ``factor``.
+
+        Keeps the samples in their original order while avoiding deterministic
+        aliasing of periodic coordinates that occurs with stride-based thinning.
+        """
+        if factor <= 1:
+            return series
+        arr = np.asarray(series)
+        n = arr.shape[0]
+        if n == 0:
+            return arr
+        target = max(1, int(np.floor(n / float(factor))))
+        if target >= n:
+            return arr
+        idx = self.rng.choice(n, size=target, replace=False)
+        idx.sort()
+        return arr[idx]
+
     def calculate_mbar(self, data, centers, bootstrap=False, n_bootstrap=0):
         """Calculate PMF using MBAR
 
@@ -590,7 +940,7 @@ class PMFAnalyzer:
         if total > mbar_cap and total > 0:
             f1 = int(np.ceil(total / float(mbar_cap)))
             print(f"[MBAR] Thinning by factor {f1} to cap {mbar_cap} samples (from {total}).")
-            data = [d[::f1] for d in data]
+            data = [self._thin_series_random(d, f1) for d in data]
             lengths = np.array([len(d) for d in data], dtype=int)
             total = int(lengths.sum())
 
@@ -600,7 +950,7 @@ class PMFAnalyzer:
         if want_elems > elem_cap and total > 0:
             f2 = int(np.ceil(want_elems / float(elem_cap)))
             print(f"[MBAR] Additional thinning by factor {f2} to honor element cap {elem_cap}.")
-            data = [d[::f2] for d in data]
+            data = [self._thin_series_random(d, f2) for d in data]
             lengths = np.array([len(d) for d in data], dtype=int)
             total = int(lengths.sum())
 
@@ -691,7 +1041,9 @@ class PMFAnalyzer:
             ends = np.where(diff == -1)[0] - 1
             if len(starts):
                 i_long = int(np.argmax(ends - starts + 1))
-                keep = slice(starts[i_long], ends[i_long] + 1)
+                # Retain the well-sampled block and everything at larger z
+                keep_start = starts[i_long]
+                keep = slice(keep_start, nb)
             else:
                 keep = slice(0, nb)
         else:
@@ -846,7 +1198,11 @@ class PMFAnalyzer:
         else:
             pmf_std = np.zeros_like(pmf)
         # Fail fast policy for MBAR results (no WHAM fallback)
-        bad_numeric = not np.all(np.isfinite(pmf)) or np.all(np.isnan(pmf))
+        if valid.any():
+            pmf_valid = pmf[valid]
+            bad_numeric = (not np.all(np.isfinite(pmf_valid))) or np.all(np.isnan(pmf_valid))
+        else:
+            bad_numeric = True
         reason = 'not_converged' if (mbar_converged is False) else ('numeric' if bad_numeric else None)
         if reason is not None:
             raise RuntimeError(f"MBAR did not converge or produced non-finite PMF (reason={reason}). Increase sampling or adjust analysis settings.")
@@ -882,6 +1238,7 @@ class PMFAnalyzer:
         # Adsorbed: search between z >= 0 and upper bound (default min(bulk_min, 2.0))
         ads_upper = float(feat_cfg.get('ads_max_z', min(getattr(self, 'bulk_min', 2.4), 2.0)))
         ads_region = (z_grid >= 0.0) & (z_grid <= ads_upper)
+        pmf_ads = None
         if np.any(ads_region):
             idx = np.argmin(pmf[ads_region])
             z_ads = float(z_grid[ads_region][idx])
@@ -892,34 +1249,26 @@ class PMFAnalyzer:
             features['delta_g_ads'] = None
             features['z_ads'] = None
         
-        # Inserted: search between lower bound (default -1.5 from config) and 0
+        # ΔG‡: barrier height relative to adsorption minimum
         ins_lower = float(feat_cfg.get('insert_min_z', -1.5))
-        insert_region = (z_grid >= ins_lower) & (z_grid <= 0.0)
-        if np.any(insert_region):
-            idx2 = np.argmin(pmf[insert_region])
-            z_ins = float(z_grid[insert_region][idx2])
-            pmf_ins = float(pmf[insert_region][idx2])
-            features['delta_g_insert'] = float(pmf_ins - pmf_bulk)
-            features['z_insert'] = z_ins
-        else:
-            features['delta_g_insert'] = None
-            features['z_insert'] = None
-        
-        # ΔG‡: barrier height
-        # Find maximum between adsorbed and inserted states
-        if features.get('z_ads') is not None and features.get('z_insert') is not None:
-            barrier_mask = (z_grid > features['z_insert']) & (z_grid < features['z_ads'])
-            if barrier_mask.any():
-                pmf_barrier = pmf[barrier_mask].max()
+        if pmf_ads is not None and features.get('z_ads') is not None:
+            barrier_region = (z_grid >= ins_lower) & (z_grid <= features['z_ads'])
+            if np.any(barrier_region):
+                idx_max = int(np.argmax(pmf[barrier_region]))
+                pmf_barrier = float(pmf[barrier_region][idx_max])
                 features['delta_g_barrier'] = float(pmf_barrier - pmf_ads)
-                features['z_barrier'] = float(z_grid[barrier_mask][np.argmax(pmf[barrier_mask])])
+                features['z_barrier'] = float(z_grid[barrier_region][idx_max])
+            else:
+                features['delta_g_barrier'] = None
+                features['z_barrier'] = None
+        else:
+            features['delta_g_barrier'] = None
+            features['z_barrier'] = None
         
         # Add uncertainties if available
         if pmf_std is not None and len(pmf_std) == len(pmf):
             if np.any(ads_region):
                 features['delta_g_ads_std'] = float(pmf_std[ads_region].mean())
-            if np.any(insert_region):
-                features['delta_g_insert_std'] = float(pmf_std[insert_region].mean())
 
         # Optional: size-normalized adsorption metrics
         try:
@@ -969,7 +1318,7 @@ class PMFAnalyzer:
           - energy_band_kj: 3.0 (only for window_mode=energy_band)
           - z_low/z_high for fixed mode or fallback
           - area_per_lipid_nm2: 0.62
-          - lp_star_range: [154, 515]
+          - lp_star_range: [45, 62]
         """
         ads_cfg = (self.config or {}).get('adsorption', {})
         mode = str(ads_cfg.get('window_mode', 'fixed')).lower()
@@ -1144,7 +1493,16 @@ class PMFAnalyzer:
             frac = float(fp_cfg.get('contact_fraction', 0.4))
             wmax = int(fp_cfg.get('windows_max', 4))
             use_rg_fallback = bool(fp_cfg.get('fallback_rgxy', True))
-            A_p = self._estimate_footprint_from_windows(z_low, z_high, contact_fraction=frac, windows_max=wmax, fallback_rgxy=use_rg_fallback)
+            A_p = None
+            if getattr(self, 'cg_footprint_nm2', None) is not None:
+                A_p = float(self.cg_footprint_nm2)
+            if A_p is None or A_p <= 0.0:
+                A_p = self._estimate_footprint_from_windows(
+                    z_low, z_high,
+                    contact_fraction=frac,
+                    windows_max=wmax,
+                    fallback_rgxy=use_rg_fallback,
+                )
             if A_p <= 0.0 and use_rg_fallback:
                 # Fall back to metadata rg_xy if available
                 try:
@@ -1533,50 +1891,49 @@ class PMFAnalyzer:
                  drawn where mask is True (helps hide edge bins with poor support).
         centers_for_ticks: optional list of window centers to draw small rug ticks.
         """
-        fig, ax = plt.subplots(figsize=(10, 6))
+        fig, ax = plt.subplots(figsize=(9.5, 6))
         
         # Shade adsorption band on water side if provided
         if isinstance(ads_band, dict):
             try:
                 m = ads_band.get('mask', None)
-                if m is not None and np.any(m):
-                    Wmin = float(ads_band.get('W_min', np.nan))
-                    band = float(ads_band.get('band_kj', 3.0))
-                    ax.fill_between(z[m], pmf[m], y2=Wmin + band, color='tab:blue', alpha=0.15, label='Adsorption band')
+                if isinstance(m, np.ndarray) and m.shape == pmf.shape:
+                    band_mask = np.logical_and(m, np.isfinite(pmf))
+                    if np.any(band_mask):
+                        Wmin = float(ads_band.get('W_min', np.nan))
+                        band = float(ads_band.get('band_kj', 3.0))
+                        ax.fill_between(z[band_mask], pmf[band_mask], y2=Wmin + band, color='tab:blue', alpha=0.15, label='Adsorption band')
             except Exception:
                 pass
 
         # Plot PMF (hide unsupported bins if ci_mask provided)
-        pmf_line = pmf.copy()
-        if ci_mask is not None and isinstance(ci_mask, np.ndarray) and ci_mask.shape == pmf.shape:
-            pmf_line = pmf_line.copy()
-            pmf_line[~ci_mask] = np.nan
+        mask_line = np.isfinite(pmf)
+        if isinstance(ci_mask, np.ndarray) and ci_mask.shape == pmf.shape:
+            mask_line = np.logical_and(mask_line, ci_mask)
+        pmf_line = np.where(mask_line, pmf, np.nan)
         ax.plot(z, pmf_line, 'b-', linewidth=2, label='PMF')
         # CI drawing with optional mask to avoid edge artifacts
         if pmf_lower is not None and pmf_upper is not None and len(pmf_lower) == len(pmf):
-            if ci_mask is None or (isinstance(ci_mask, np.ndarray) and ci_mask.dtype==bool and ci_mask.shape==pmf.shape):
-                # draw in contiguous segments where mask True
-                mask = ci_mask if ci_mask is not None else np.ones_like(pmf, dtype=bool)
-                # robust segment detection via diff on padded mask
-                m = mask.astype(np.int8)
+            mask_ci = mask_line & np.isfinite(pmf_lower) & np.isfinite(pmf_upper)
+            if np.any(mask_ci):
+                m = mask_ci.astype(np.int8)
                 diff = np.diff(np.concatenate(([0], m, [0])))
                 starts = np.where(diff == 1)[0]
                 ends = np.where(diff == -1)[0] - 1
                 for s, e in zip(starts, ends):
                     ax.fill_between(z[s:e+1], pmf_lower[s:e+1], pmf_upper[s:e+1], color='b', alpha=0.2)
                 ax.plot([], [], color='b', alpha=0.2, label='95% CI')
-            else:
-                ax.fill_between(z, pmf_lower, pmf_upper, color='b', alpha=0.2, label='95% CI')
         elif pmf_std is not None and len(pmf_std) == len(pmf):
-            ax.fill_between(z, pmf - pmf_std, pmf + pmf_std, alpha=0.3)
+            mask_std = mask_line & np.isfinite(pmf_std)
+            if np.any(mask_std):
+                lower = np.where(mask_std, pmf - pmf_std, np.nan)
+                upper = np.where(mask_std, pmf + pmf_std, np.nan)
+                ax.fill_between(z, lower, upper, alpha=0.3)
         
         # Mark features
         if features.get('z_ads') is not None:
             ax.axvline(features['z_ads'], color='g', linestyle='--', alpha=0.5, 
                       label=f"Adsorbed: {features['delta_g_ads']:.1f} kJ/mol")
-        if features.get('z_insert') is not None:
-            ax.axvline(features['z_insert'], color='r', linestyle='--', alpha=0.5,
-                      label=f"Inserted: {features['delta_g_insert']:.1f} kJ/mol")
         if features.get('z_barrier') is not None:
             ax.axvline(features['z_barrier'], color='orange', linestyle='--', alpha=0.5,
                       label=f"ΔG‡ vs ads: {features['delta_g_barrier']:.1f} kJ/mol")
@@ -1601,7 +1958,7 @@ class PMFAnalyzer:
                 band = 0.05 * (ymax - ymin)
                 ax.fill_between(z, ymin, ymin + band * c, color='k', alpha=0.15, step='mid')
         ax.legend(loc='best')
-        ax.grid(True, alpha=0.3)
+        _format_publication_axes(ax)
         
         plt.tight_layout()
         plt.savefig(output_file, dpi=300, bbox_inches='tight')
@@ -1611,7 +1968,7 @@ class PMFAnalyzer:
                                  pmf_lower=None, pmf_upper=None, ci_mask=None, coverage_counts=None, ads_band: dict | None = None):
         """Two-panel figure: top PMF (with CI and coverage bar), bottom per-window z-histograms."""
         import matplotlib.gridspec as gridspec
-        fig = plt.figure(figsize=(10, 8))
+        fig = plt.figure(figsize=(9.5, 8))
         gs = gridspec.GridSpec(2, 1, height_ratios=[2.5, 1.5])
         ax_top = fig.add_subplot(gs[0])
         # Top panel: PMF (mask unsupported bins if ci_mask provided)
@@ -1619,24 +1976,23 @@ class PMFAnalyzer:
         if isinstance(ads_band, dict):
             try:
                 m = ads_band.get('mask', None)
-                if m is not None and np.any(m):
-                    Wmin = float(ads_band.get('W_min', np.nan))
-                    band = float(ads_band.get('band_kj', 3.0))
-                    ax_top.fill_between(z[m], pmf[m], y2=Wmin + band, color='tab:blue', alpha=0.15, label='Adsorption band')
+                if isinstance(m, np.ndarray) and m.shape == pmf.shape:
+                    band_mask = np.logical_and(m, np.isfinite(pmf))
+                    if np.any(band_mask):
+                        Wmin = float(ads_band.get('W_min', np.nan))
+                        band = float(ads_band.get('band_kj', 3.0))
+                        ax_top.fill_between(z[band_mask], pmf[band_mask], y2=Wmin + band, color='tab:blue', alpha=0.15, label='Adsorption band')
             except Exception:
                 pass
-        pmf_line = pmf.copy()
-        if ci_mask is not None and isinstance(ci_mask, np.ndarray) and ci_mask.shape == pmf.shape:
-            pmf_line = pmf_line.copy()
-            pmf_line[~ci_mask] = np.nan
+        mask_line = np.isfinite(pmf)
+        if isinstance(ci_mask, np.ndarray) and ci_mask.shape == pmf.shape:
+            mask_line = np.logical_and(mask_line, ci_mask)
+        pmf_line = np.where(mask_line, pmf, np.nan)
         ax_top.plot(z, pmf_line, 'b-', linewidth=2)
         if pmf_lower is not None and pmf_upper is not None:
-            # draw masked CI
-            if ci_mask is None:
-                ax_top.fill_between(z, pmf_lower, pmf_upper, color='b', alpha=0.2)
-            else:
-                mask = ci_mask
-                m = mask.astype(np.int8)
+            mask_ci = mask_line & np.isfinite(pmf_lower) & np.isfinite(pmf_upper)
+            if np.any(mask_ci):
+                m = mask_ci.astype(np.int8)
                 diff = np.diff(np.concatenate(([0], m, [0])))
                 starts = np.where(diff == 1)[0]
                 ends = np.where(diff == -1)[0] - 1
@@ -1646,9 +2002,6 @@ class PMFAnalyzer:
         if features.get('z_ads') is not None:
             ax_top.axvline(features['z_ads'], color='g', linestyle='--', alpha=0.5,
                            label=f"Adsorbed: {features['delta_g_ads']:.1f} kJ/mol")
-        if features.get('z_insert') is not None:
-            ax_top.axvline(features['z_insert'], color='r', linestyle='--', alpha=0.5,
-                           label=f"Inserted: {features['delta_g_insert']:.1f} kJ/mol")
         if features.get('z_barrier') is not None:
             ax_top.axvline(features['z_barrier'], color='orange', linestyle='--', alpha=0.5,
                            label=f"ΔG‡ vs ads: {features['delta_g_barrier']:.1f} kJ/mol")
@@ -1669,7 +2022,7 @@ class PMFAnalyzer:
             for cc in centers:
                 ax_top.vlines(cc, ymin, ymin + h, colors='k', alpha=0.25, linewidth=1)
         ax_top.legend(loc='best')
-        ax_top.grid(True, alpha=0.3)
+        _format_publication_axes(ax_top)
 
         # Bottom panel: per-window histograms
         ax_bottom = fig.add_subplot(gs[1], sharex=ax_top)
@@ -1682,7 +2035,7 @@ class PMFAnalyzer:
         ax_bottom.set_xlabel('z-coordinate (nm)')
         ax_bottom.set_ylabel('Density (a.u.)')
         ax_bottom.set_title('Per-window z-histograms (normalized)')
-        ax_bottom.grid(True, alpha=0.3)
+        _format_publication_axes(ax_bottom)
 
         plt.tight_layout()
         fig.savefig(output_file, dpi=300, bbox_inches='tight')
@@ -1694,33 +2047,36 @@ class PMFAnalyzer:
         Draws PMF with shaded energy band and overlays the integrand exp(-beta*W)-1 within the band.
         """
         try:
-            fig, ax1 = plt.subplots(figsize=(7, 4))
-            ax1.plot(z, pmf, color='tab:blue', lw=2, label='PMF')
+            fig, ax1 = plt.subplots(figsize=(7.5, 4.2))
+            pmf_line = np.where(np.isfinite(pmf), pmf, np.nan)
+            ax1.plot(z, pmf_line, color='tab:blue', lw=2, label='PMF')
             # Shade band
             if isinstance(ads_band, dict):
                 m = ads_band.get('mask', None)
-                if m is not None and np.any(m):
-                    Wmin = float(ads_band.get('W_min', np.nan))
-                    band = float(ads_band.get('band_kj', 3.0))
-                    ax1.fill_between(z[m], pmf[m], y2=Wmin + band, color='tab:blue', alpha=0.15, label='Adsorption band')
+                if isinstance(m, np.ndarray) and m.shape == pmf.shape:
+                    band_mask = np.logical_and(m, np.isfinite(pmf))
+                    if np.any(band_mask):
+                        Wmin = float(ads_band.get('W_min', np.nan))
+                        band = float(ads_band.get('band_kj', 3.0))
+                        ax1.fill_between(z[band_mask], pmf[band_mask], y2=Wmin + band, color='tab:blue', alpha=0.15, label='Adsorption band')
             ax1.set_xlabel('z (nm)')
             ax1.set_ylabel('PMF (kJ/mol)')
-            ax1.grid(alpha=0.3)
+            _format_publication_axes(ax1)
 
             # Overlay integrand on twin axis for the band region
             try:
                 ax2 = ax1.twinx()
-                integ = np.exp(-self.beta * pmf) - 1.0
-                mask = None
                 if isinstance(ads_band, dict):
                     mask = ads_band.get('mask')
-                if mask is not None and np.any(mask):
-                    y = np.where(mask, integ, np.nan)
                 else:
-                    y = np.full_like(integ, np.nan)
-                ax2.plot(z, y, color='tab:orange', lw=1.5, alpha=0.8, label='exp(-βW)-1 (band)')
+                    mask = None
+                if isinstance(mask, np.ndarray) and mask.shape == pmf.shape:
+                    valid = np.logical_and(mask, np.isfinite(pmf))
+                    if np.any(valid):
+                        integ = np.exp(-self.beta * pmf[valid]) - 1.0
+                        ax2.plot(z[valid], integ, color='tab:orange', lw=1.5, alpha=0.8, label='exp(-βW)-1 (band)')
                 ax2.set_ylabel('Integrand (a.u.)', color='tab:orange')
-                ax2.tick_params(axis='y', labelcolor='tab:orange')
+                ax2.tick_params(axis='y', labelcolor='tab:orange', direction='out', width=1.0, length=5.0)
             except Exception:
                 pass
 
@@ -1753,7 +2109,7 @@ class PMFAnalyzer:
     
     def plot_overlap_heatmap(self, overlap_matrix, centers, output_file):
         """Plot window overlap heatmap"""
-        fig, ax = plt.subplots(figsize=(10, 8))
+        fig, ax = plt.subplots(figsize=(8.5, 7))
         # Sort by center for a monotonic diagonal
         centers = np.asarray(centers)
         order = np.argsort(centers)
@@ -1777,6 +2133,7 @@ class PMFAnalyzer:
         ax.set_ylabel('Window center (nm)', fontsize=12)
         ax.set_title('Window Overlap Matrix', fontsize=14)
         
+        _format_publication_axes(ax)
         plt.tight_layout()
         plt.savefig(output_file, dpi=300, bbox_inches='tight')
         plt.close()
@@ -1794,6 +2151,7 @@ class PMFAnalyzer:
         # ESS diagnostics
         print("\nEstimating ESS per window...")
         g_k, ess_k = self.estimate_ess_per_window(data)
+        ess_mean_val = float(ess_k.mean()) if ess_k.size else None
         print(f"ESS (mean/min): {ess_k.mean():.1f} / {ess_k.min():.1f}")
         
         if len(data) < 3:
@@ -1826,54 +2184,37 @@ class PMFAnalyzer:
         except Exception:
             counts_feat = None
         features = self.extract_features(z_grid, pmf, pmf_std, counts=counts_feat)
+        if self.cg_footprint_nm2 is not None:
+            features['footprint_cg_nm2'] = float(self.cg_footprint_nm2)
+        if self.cg_rg_xy_nm is not None:
+            features['rg_xy_cg_nm'] = float(self.cg_rg_xy_nm)
+        if self.cg_sequence_length is not None:
+            features.setdefault('sequence_length', int(self.cg_sequence_length))
+            features['sequence_length_cg'] = int(self.cg_sequence_length)
+        if ess_mean_val is not None:
+            features['ess_mean'] = ess_mean_val
+        if self.sequence_descriptors:
+            for key, value in self.sequence_descriptors.items():
+                if key not in features or features.get(key) is None:
+                    features[key] = value
 
         # Compute adsorption metrics early so plots can use them
         adsorption = self.compute_adsorption_metrics(
             z_grid, pmf, pmf_std, pmf_lower, pmf_upper, counts=counts_feat
         )
+        if self.cg_footprint_nm2 and not adsorption.get('footprint_nm2'):
+            adsorption['footprint_nm2'] = float(self.cg_footprint_nm2)
+
+        self._apply_rank_model(features, adsorption, ess_mean_val)
 
         # Compute HC50/Kp via adsorption-only module (water-side energy band)
         ads_band = None
         ads_params_out = None
-        try:
-            if AdsorptionParams is not None and compute_kp_ads_nm is not None:
-                ads_cfg = (self.config or {}).get('adsorption', {})
-                feat_cfg = (self.config or {}).get('feature_params', {})
-                sim_cfg = (self.config or {}).get('simulation', {})
-                aparams = AdsorptionParams(
-                    temperature_K=float(sim_cfg.get('temperature', self.temperature)),
-                    energy_band_kj=float(ads_cfg.get('energy_band_kj', 3.0)),
-                    area_per_lipid_nm2=float(ads_cfg.get('area_per_lipid_nm2', 0.62)),
-                    bilayer_factor=float(ads_cfg.get('bilayer_factor', 2.0)),
-                    lp_star_range=tuple((ads_cfg.get('lp_star_range') or [154.0, 515.0])[:2]),
-                    z_ads_max_nm=float(feat_cfg.get('ads_max_z', 2.0)),
-                    z_lo_hi_nm=(float((ads_cfg.get('membrane') or {}).get('z_lo', -1.5)),
-                                float((ads_cfg.get('membrane') or {}).get('z_hi', 1.5))),
-                    min_bin_count=int((self.config.get('plot') or {}).get('pmf_min_bin_count', 25)),
-                )
-                kp_nm, meta = compute_kp_ads_nm(z_grid, pmf, counts_feat, aparams)
-                hc = compute_hc50_uM_from_kp(kp_nm, aparams)
-                ads_params_out = {
-                    'area_per_lipid_nm2': aparams.area_per_lipid_nm2,
-                    'bilayer_factor': aparams.bilayer_factor,
-                    'lp_star_range': [float(aparams.lp_star_range[0]), float(aparams.lp_star_range[1])]
-                }
-                # HC50/Kp values from the module are currently used for plotting and optional annotations.
-                # Build adsorption band mask for shading
-                try:
-                    Wmin = float(meta.get('W_min_kj_per_mol'))
-                    band = float(aparams.energy_band_kj)
-                    z_lo, z_hi = aparams.z_lo_hi_nm
-                    m = (z_grid >= 0.0) & (z_grid <= aparams.z_ads_max_nm) & (z_grid >= z_lo) & (z_grid <= z_hi)
-                    if counts_feat is not None:
-                        m &= (counts_feat >= aparams.min_bin_count)
-                    m &= (pmf <= (Wmin + band))
-                    if np.any(m):
-                        ads_band = {'mask': m, 'W_min': Wmin, 'band_kj': band}
-                except Exception:
-                    pass
-        except Exception:
-            pass
+        ads_params_out = {
+            'area_per_lipid_nm2': float((self.config.get('adsorption') or {}).get('area_per_lipid_nm2', 0.62)),
+            'bilayer_factor': float((self.config.get('adsorption') or {}).get('bilayer_factor', 1.0)),
+            'lp_star_range': [float(x) for x in (self.config.get('adsorption') or {}).get('lp_star_range', [45, 62])]
+        }
         
         # Convergence check removed (redundant and expensive)
         convergence_value = None
@@ -2078,6 +2419,12 @@ class PMFAnalyzer:
                 'n_samples': n_bootstrap
             }
         }
+        if self.peptide_sequence:
+            results.setdefault('peptide', {})['sequence'] = self.peptide_sequence
+        if self.peptide_id:
+            results.setdefault('peptide', {})['id'] = self.peptide_id
+        if self.sequence_descriptors:
+            results['sequence_features'] = self.sequence_descriptors
         # Add extra QC metrics
         results['quality_metrics']['overlap_summary'] = overlap_summary
         results['quality_metrics']['block_stability_R'] = block_R.tolist()
@@ -2148,8 +2495,6 @@ class PMFAnalyzer:
             print(f"  ΔG_ads/area: {features['delta_g_ads_per_area_kj_per_mol_nm2']:.2f} kJ/mol/nm²")
         if features.get('delta_g_ads_per_res_kj_per_mol') is not None:
             print(f"  ΔG_ads/res: {features['delta_g_ads_per_res_kj_per_mol']:.2f} kJ/mol/res")
-        if features.get('delta_g_insert') is not None:
-            print(f"  ΔG_insert: {features['delta_g_insert']:.2f} kJ/mol")
         if features.get('delta_g_barrier') is not None:
             print(f"  ΔG‡: {features['delta_g_barrier']:.2f} kJ/mol")
         # Print adsorption/HC50 summary
@@ -2169,6 +2514,9 @@ class PMFAnalyzer:
             hc50_uM_rng = adsorption.get('hc50_uM_range')
             if hc50_uM_rng:
                 print(f"  HC50 (L/P*={int(adsorption['lp_star_range'][0])}-{int(adsorption['lp_star_range'][1])}): {hc50_uM_rng[0]:.2f}–{hc50_uM_rng[1]:.2f} µM")
+            hc50_rank = adsorption.get('hc50_rank_uM')
+            if hc50_rank is not None:
+                print(f"  HC50_rank (monotonic model): {hc50_rank:.2f} µM")
         print(f"\nQuality Metrics:")
         # Adjacent neighbors (matches QC report)
         if overlap_summary['mean_overlap_adjacent'] is not None:
@@ -2256,11 +2604,21 @@ def _classify(results: dict):
     features = (results or {}).get('features') or {}
     classification = {"toxic": None, "basis": None}
 
+    rank_val = ads.get('hc50_rank_uM') or features.get('hc50_rank_uM')
+    if rank_val is not None and np.isfinite(rank_val):
+        max_uM = float(rank_val)
+        severity = "toxic" if max_uM <= c_tox else ("borderline" if max_uM <= c_border else "non_toxic")
+        classification["basis"] = "hc50_rank"
+        classification["severity"] = severity
+        classification["label"] = severity
+        classification["hc50_uM"] = float(max_uM)
+        classification["toxic"] = bool(severity == "toxic")
+        return classification
+
     rng = ads.get('hc50_uM_range')
     if use_hc50 and isinstance(rng, (list, tuple)) and len(rng) == 2 and all(isinstance(x, (int, float)) for x in rng):
         max_uM = float(max(rng))
-        severity = ("toxic" if max_uM <= c_tox else ("borderline" if max_uM <= c_border else "non_toxic"))
-        # Optional additional requirement: per-area ΔG threshold
+        severity = "toxic" if max_uM <= c_tox else ("borderline" if max_uM <= c_border else "non_toxic")
         also_req = (rules.get('also_require') or {})
         thr_area = also_req.get('dg_ads_per_area_kj_per_mol_nm2', None)
         meets_area = True
@@ -2271,15 +2629,13 @@ def _classify(results: dict):
                 meets_area = (val is not None) and (float(val) <= thr_area)
             except Exception:
                 meets_area = False
-        # Final decision
         classification["basis"] = "hc50" + ("+area" if thr_area is not None else "")
         classification["severity"] = severity
         classification["label"] = severity
-        classification["hc50_uM"] = rng
+        classification["hc50_uM"] = [float(rng[0]), float(rng[1])]
         classification["toxic"] = bool(severity == "toxic" and meets_area)
         return classification
 
-    # No HC50 available -> undetermined
     return {"toxic": None, "basis": "no_hc50", "label": "undetermined"}
 
 def _aggregate_features(rep_features: list):
@@ -2447,7 +2803,7 @@ def main():
         cfg = _load_global_pmf_config()
         tol = ((cfg.get('pmf') or {}).get('qc') or {}).get('replicate_tolerance', 2.0)
         consistency = {}
-        for key in ['delta_g_ads', 'delta_g_insert']:
+        for key in ['delta_g_ads']:
             vals = [rf['features'].get(key) for rf in rep_results if rf['features'].get(key) is not None]
             if len(vals) >= 2:
                 spread = float(np.max(vals) - np.min(vals))

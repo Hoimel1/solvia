@@ -40,7 +40,7 @@ The SOLVIA repository has been transformed into a focused **PMF-based Toxpredict
 ### 6. **Quality Control System** ✅
 - **Problem**: No QC gates
 - **Solution**: Comprehensive QC with auto-correction suggestions
-- **File**: `scripts/analysis/pmf_qc_system.py`
+- **File**: `scripts/analysis/qc_audit.py`
 
 ## 📁 New Files Created
 
@@ -54,7 +54,7 @@ scripts/universal/
 
 scripts/analysis/
 ├── pmf_mbar_analysis.py           # WHAM/MBAR analysis pipeline
-└── pmf_qc_system.py               # Quality control system
+└── qc_audit.py               # Quality control system
 ```
 
 ### Configuration

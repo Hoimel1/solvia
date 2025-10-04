@@ -181,6 +181,8 @@ class PMFRunner:
         self.qc_discard_frac = float(self.qc_config.get('discard_fraction', 0.1))
         # QC: optional stride for ESS to mitigate oversampling bias (supports int or "auto")
         self.qc_ess_stride = self.qc_config.get('ess_stride', 1)
+        self.strict_qc = bool(self.qc_config.get('strict_mode', False))
+        self.strict_failure = False
         # Ensure same reference group across all windows to avoid analysis bias
         self.consistent_reference = bool(self.umbrella_config.get('consistent_reference', True))
         self.common_index_file = None
@@ -1781,11 +1783,19 @@ define                 = -DPOSRES_LIPID_Z
                 sys.stdout.write(f"\r  Progress: {line.strip()[:80]}")
                 sys.stdout.flush()
             # Show important messages
-            elif any(keyword in line for keyword in ["WARNING", "ERROR", "Note", "Writing", "Back Off!"]):
+            elif "Back Off!" in line:
                 sys.stdout.write(f"\n  {line.strip()}\n")
                 sys.stdout.flush()
-                if ("LINCS WARNING" in line) or ("Back Off!" in line):
+                continue
+            elif any(keyword in line for keyword in ["WARNING", "ERROR", "Note", "Writing"]):
+                sys.stdout.write(f"\n  {line.strip()}\n")
+                sys.stdout.flush()
+                if ("LINCS WARNING" in line) or ("Fatal error" in line) or ("Constraint error" in line):
                     lincs_flag = True
+                    try:
+                        process.terminate()
+                    except Exception:
+                        pass
                     try:
                         process.terminate()
                     except Exception:
@@ -1800,7 +1810,7 @@ define                 = -DPOSRES_LIPID_Z
         process.wait()
         sys.stdout.write("\n")  # New line after progress
         
-        if process.returncode == 0 and not lincs_flag:
+        if process.returncode == 0:
             self._invalidate_qc_cache(pullx_file)
             print(f"✓ Window z={window_center:.3f} nm completed")
             return {
@@ -1963,10 +1973,14 @@ pull-coord1-start       = yes
             if "step" in line.lower():
                 sys.stdout.write(f"\r  Progress: {line.strip()[:80]}")
                 sys.stdout.flush()
-            elif any(keyword in line for keyword in ["WARNING", "ERROR", "Note", "Writing", "Back Off!"]):
+            elif "Back Off!" in line:
                 sys.stdout.write(f"\n  {line.strip()}\n")
                 sys.stdout.flush()
-                if ("LINCS WARNING" in line) or ("Back Off!" in line):
+                continue
+            elif any(keyword in line for keyword in ["WARNING", "ERROR", "Note", "Writing"]):
+                sys.stdout.write(f"\n  {line.strip()}\n")
+                sys.stdout.flush()
+                if ("LINCS WARNING" in line) or ("Fatal error" in line) or ("Constraint error" in line):
                     lincs_flag = True
             current_time = time.time()
             if current_time - last_time > 5:
@@ -1975,7 +1989,7 @@ pull-coord1-start       = yes
                 last_time = current_time
         process.wait()
         sys.stdout.write("\n")
-        if process.returncode == 0 and not lincs_flag:
+        if process.returncode == 0:
             self._invalidate_qc_cache(pullx_file)
             print(f"✓ Window z={window_center:.3f} nm completed (after stabilization)")
             return {
@@ -2089,7 +2103,7 @@ pull-coord1-start       = yes
             print(f"Extended {extended} windows due to ESS/half-time QC failures.")
         return new_windows, extended, extended_entries
 
-    def _replicate_low_ess_windows(self, pmf_dir: Path, windows_data, qc_results, start_structure, replicate):
+    def _replicate_low_ess_windows(self, pmf_dir: Path, windows_data, qc_results, start_structure, replicate, targets_override=None):
         """Fallback: replicate low-ESS or half-failing windows with new seeds.
 
         Strategy (configurable in pmf.qc.fallback):
@@ -2117,10 +2131,18 @@ pull-coord1-start       = yes
 
         # Select target centers to replicate
         targets = []
+        allowed = None
+        if targets_override is not None:
+            try:
+                allowed = {_round3(float(t)) for t in targets_override}
+            except Exception:
+                allowed = {_round3(float(t)) for t in list(targets_override)}
         for w in sorted([w for w in windows_data if w], key=lambda x: x['center'], reverse=True):
             key = int(_round3(w['center'])*1000)
             ess = ess_map.get(key, 0)
             half_ok = half_map.get(key, True)
+            if allowed is not None and _round3(float(w['center'])) not in allowed:
+                continue
             if (ess < min_ess_trig) or (not half_ok):
                 targets.append(float(w['center']))
         targets = _dedup_sorted_centers(targets)
@@ -2227,7 +2249,29 @@ pull-coord1-start       = yes
         ess_entries = _active(qc_results.get('ess_check', []))
         ol = all(item.get('passed', False) for item in ol_entries) if ol_entries else True
         ess = all(item.get('passed', False) for item in ess_entries) if ess_entries else True
+        require_half = bool(self.qc_config.get('require_half_convergence', False))
+        if require_half:
+            half_entries = _active(qc_results.get('convergence_check', []))
+            half_ok = all(entry.get('passed', entry.get('half_pass', False)) for entry in half_entries) if half_entries else True
+            ess = ess and half_ok
         return ol, ess
+
+    def _collect_problem_centers(self, qc_results, include_half=True):
+        centers = []
+        for entry in qc_results.get('ess_check', []) or []:
+            try:
+                if not entry.get('passed', False):
+                    centers.append(float(entry.get('center')))
+            except Exception:
+                continue
+        if include_half:
+            for entry in qc_results.get('convergence_check', []) or []:
+                try:
+                    if not entry.get('passed', entry.get('half_pass', False)):
+                        centers.append(float(entry.get('center')))
+                except Exception:
+                    continue
+        return _dedup_sorted_centers(centers)
     
     def find_topology_file(self):
         """Find the appropriate topology file"""
@@ -2624,6 +2668,7 @@ pull-coord1-start       = yes
         if max_keep < 1:
             max_keep = 0
         prefer_by = str(fcfg.get('prefer_by', 'ess')).lower()
+        respect_gates = bool(fcfg.get('respect_gates', True))
 
         # Group windows by center
         centers = {}
@@ -2635,6 +2680,7 @@ pull-coord1-start       = yes
         selected_windows = []
         for c, wins in sorted(centers.items(), key=lambda kv: kv[0], reverse=True):
             items = []
+            gating_candidates = []
             for w in wins:
                 reg = self._region_cfg(w['center'])
                 kw = float(w.get('k', k_global))
@@ -2644,12 +2690,22 @@ pull-coord1-start       = yes
                                 (float(qc.get('half_z_stat', 0.0)) <= float(reg["half_z_tol_sigma"]))
                 reason = []
                 drop = False
+                ess_val = int(qc.get('ess', 0))
+                ess_gate = int(reg.get('min_ess_frames', min_ess))
                 if drop_half and not half_pass_reg:
                     drop = True; reason.append('half_fail')
                 if drop_drift and not qc.get('drift_pass', True):
                     drop = True; reason.append('drift_fail')
-                if int(qc.get('ess', 0)) < min_ess:
+                if ess_val < min_ess:
                     drop = True; reason.append(f"ess<{min_ess}")
+                passes_gate = (ess_val >= ess_gate) and (not drop_half or half_pass_reg)
+                if respect_gates and passes_gate and drop:
+                    if any(r.startswith('ess<') for r in reason):
+                        reason = [r for r in reason if not r.startswith('ess<')]
+                    if not (drop_half and not half_pass_reg) and not (drop_drift and not qc.get('drift_pass', True)):
+                        drop = False
+                if passes_gate:
+                    gating_candidates.append({'window': w, 'qc': qc, 'half_pass': half_pass_reg})
                 items.append({
                     'center': float(c),
                     'pullx': w['pullx'],
@@ -2676,6 +2732,20 @@ pull-coord1-start       = yes
                     else:
                         items_sorted = sorted(items, key=lambda it: (-it['qc']['ess']))
                     survivors = items_sorted[:max(1, min_keep)]
+                elif respect_gates and gating_candidates:
+                    if prefer_by.startswith('half'):
+                        gating_sorted = sorted(gating_candidates, key=lambda it: ((not it['half_pass']), -it['qc'].get('ess', 0)))
+                    else:
+                        gating_sorted = sorted(gating_candidates, key=lambda it: (-it['qc'].get('ess', 0)))
+                    survivors = []
+                    for cand in gating_sorted[:max(1, min_keep)]:
+                        target_pullx = cand['window']['pullx']
+                        match = next((it for it in items if it['pullx'] == target_pullx), None)
+                        if match:
+                            match['drop'] = False
+                            if f"ess<{min_ess}" in match['reason']:
+                                match['reason'] = [r for r in match['reason'] if r != f"ess<{min_ess}"]
+                            survivors.append(match)
                 else:
                     survivors = []
             # Hard cap on survivors per center if requested
@@ -3122,13 +3192,34 @@ pull-coord1-start       = yes
             except Exception:
                 pass
 
+            replicated_now = 0
+            fallback_cfg = (self.qc_config.get('fallback') or {})
+            if bool(fallback_cfg.get('auto_after_extend', True)):
+                include_half = bool(fallback_cfg.get('include_half_convergence', True))
+                qc_results = self.run_qc_checks(windows_data)
+                early_targets = self._collect_problem_centers(qc_results, include_half=include_half)
+                if early_targets:
+                    self.logger.info(f"QC round {round_idx+1}: early fallback for {len(early_targets)} window(s)")
+                    windows_data, replicated_now, repl_entries_now = self._replicate_low_ess_windows(
+                        pmf_dir, windows_data, qc_results, start_structure, replicate, targets_override=early_targets
+                    )
+                    if repl_entries_now:
+                        round_log["replicated"].extend(repl_entries_now)
+                        all_centers.extend([float(entry['center']) for entry in repl_entries_now])
+                    qc_results = self.run_qc_checks(windows_data)
+                    overlap_ok, ess_ok = self._qc_gates_passed(qc_results)
+                else:
+                    overlap_ok, ess_ok = self._qc_gates_passed(qc_results)
+            else:
+                overlap_ok, ess_ok = self._qc_gates_passed(qc_results)
+
             # Decide whether to continue
             round_idx += 1
             if not unlimited and round_idx >= max_rounds and not (overlap_ok and ess_ok):
                 self.logger.warning("Reached max_qc_rounds before all QC gates passed.")
                 self.round_history.append(round_log)
                 break
-            if added == 0 and extended == 0:
+            if added == 0 and extended == 0 and replicated_now == 0:
                 # No more actions possible; avoid infinite loop
                 self.logger.warning("QC gates not fully satisfied, but no windows were added or extended in this round. Stopping.")
                 self.round_history.append(round_log)
@@ -3162,6 +3253,11 @@ pull-coord1-start       = yes
         # Select good replicates per center and update metadata payload
         windows_selected, selection = self._filter_windows_by_qc(windows_data, pmf_dir)
         qc_results = self._annotate_superseded_qc(qc_results, selection)
+        overlap_ok_final, ess_ok_final = self._qc_gates_passed(qc_results)
+        strict_info = qc_results.setdefault('strict_mode', {})
+        strict_info['enabled'] = bool(self.strict_qc)
+        strict_info['ess_pass'] = bool(ess_ok_final)
+        strict_info['overlap_pass'] = bool(overlap_ok_final)
         self.generate_qc_report(qc_results, pmf_dir)
         if windows_selected:
             windows_data = windows_selected
@@ -3198,13 +3294,17 @@ pull-coord1-start       = yes
         # Final summary with more details + completion gating
         successful_windows = len([w for w in windows_data if w])
         # Re-evaluate gates for final status
-        overlap_ok, ess_ok = self._qc_gates_passed(qc_results)
+        overlap_ok, ess_ok = overlap_ok_final, ess_ok_final
         gate_cfg = (self.qc_config.get('completion_gate') or {})
         try:
             min_frac = float(gate_cfg.get('min_fraction', 0.6))
         except Exception:
             min_frac = 0.6
         completion_ok = (successful_windows / max(1, len(window_centers)) >= min_frac) and overlap_ok and ess_ok
+        strict_info['failed'] = bool(self.strict_qc and not (overlap_ok and ess_ok))
+        if strict_info['failed']:
+            self.strict_failure = True
+            self.logger.error("Strict QC mode enabled: ESS/overlap gates failed; aborting downstream analysis.")
         if completion_ok:
             self.logger.info("✅ PMF CALCULATION COMPLETED")
         else:
@@ -3241,6 +3341,7 @@ def main():
     parser.add_argument("--resume", action="store_true", help="Resume an incomplete run (skip existing windows)")
     parser.add_argument("--qc-only", action="store_true", help="Only generate qc_report.yaml + pmf_metadata.yaml from existing windows")
     parser.add_argument("--preflight-only", action="store_true", help="Validate reference and plan windows; no MD")
+    parser.add_argument("--strict-qc", action="store_true", help="Abort downstream analysis when ESS/overlap gates fail")
     
     args = parser.parse_args()
     
@@ -3249,9 +3350,12 @@ def main():
     if args.preflight_only:
         runner.run_preflight(replicate=args.replicate, tag=args.tag)
         return
-    
+    if args.strict_qc:
+        runner.strict_qc = True
     # Run PMF calculation
     runner.run_pmf_calculation(replicate=args.replicate, tag=args.tag, resume=args.resume, qc_only=args.qc_only)
+    if runner.strict_failure:
+        sys.exit(2)
 
 if __name__ == "__main__":
     main()

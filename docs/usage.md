@@ -129,7 +129,7 @@ Hinweise:
 cd /home/michelhuller/solvia
 
 # Run-Setup für einzelnes Peptid
-python3 scripts/universal/01_setup_run.py data/raw/fasta/SOLVIA_1.fasta
+python3 scripts/universal/01_setup_run.py data/raw/fasta/SOLVIA_12.fasta
 
 # Struktur:
 # simulations/solvia_1_run_1/
@@ -141,7 +141,7 @@ python3 scripts/universal/01_setup_run.py data/raw/fasta/SOLVIA_1.fasta
 
 ```bash
 # Variable für Run-Verzeichnis
-RUN_DIR="simulations/solvia_68_run_2"
+RUN_DIR="simulations/solvia_1219_run_1"
 
 # ColabFold für Strukturvorhersage
 docker compose run --rm \
@@ -340,6 +340,15 @@ for REP in 1 2 3; do
     --tag pmf_rep${REP}
 done
 
+# Strenger QC: bricht ab, falls ESS/Overlap-Gates reißen
+python3 scripts/universal/08_run_pmf.py ${RUN_DIR} \
+  --replicate 1 \
+  --tag pmf_midplane \
+  --strict-qc
+
+
+> Hinweis: Dauerhaft aktivierbar via `pmf.qc.strict_mode: true` in `config/pmf_standard_config.yaml`.
+
 # Features:
 # - Lokale Midplane-Referenz (balancierte Outer/Inner PO4, ~2.5 nm Radius; pbcatom=COM)
 # - Adaptive Fenster-Verdichtung
@@ -379,6 +388,7 @@ python3 scripts/universal/08_run_pmf.py ${RUN_DIR} \
 # ${RUN_DIR}/pmf/<tag>/qc_report.yaml  # QC-Zusammenfassung
 # ${RUN_DIR}/pmf/<tag>/pmf_metadata.yaml  # Metadaten für Analyse (inkl. windows[].k)
 # ${RUN_DIR}/pmf/<tag>/RUN_INFO.yaml   # Provenienz (Git, Container, Env)
+# ${RUN_DIR}/pmf/<tag>/RESIMULATE.flag # Marker bei aktivem strict/qc_audit
 ```
 
 ## Schritt 7: PMF-Analyse mit MBAR
@@ -393,7 +403,7 @@ python3 scripts/analysis/pmf_mbar_analysis.py \
 
 python3 scripts/analysis/pmf_mbar_analysis.py \
   ${RUN_DIR}/pmf/pmf_midplane \
-  --bootstrap 100
+  --bootstrap 200
 
 # Output:
 # - pmf_analysis_results.yaml    # Features & Metriken
@@ -436,16 +446,16 @@ features:
 ### 8.1 Umfassendes QC-System
 
 ```bash
-# QC-Report mit Korrekturvorschlägen
-python3 scripts/analysis/pmf_qc_system.py \
-  ${RUN_DIR}/pmf/replicate_1 \
-  --suggest
+# Automatisierter QC-Audit (gesamte simulations/-Hierarchy)
+python3 scripts/analysis/qc_audit.py simulations \
+  --output-dir analysis/qc \
+  --mark-resim
 
-# Prüft:
-# - Window-Overlap (min 10%, target 20%)
-# - Konvergenz (Halbzeit-Differenz < 2 kJ/mol)
-# - ESS (≥ 200 unabhängige Frames)
-# - Replikat-Konsistenz (< 2 kJ/mol Differenz)
+# Outputs:
+# - analysis/qc/qc_report.csv      # tabellarische Übersicht
+# - analysis/qc/qc_report.md       # Markdown-Review
+# - analysis/qc/qc_resimulate.yaml # Runs + Gründe für Re-Simulation
+# - RESIMULATE.flag in pmf/<tag>/  # Marker für erneutes Sampling
 ```
 
 ### 8.2 Manuelle Checks

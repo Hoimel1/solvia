@@ -1,0 +1,39 @@
+path,peptide,run,flags
+simulations/solvia_1564_run_1/pmf/pmf_midplane/pmf_analysis_results.yaml,solvia_1564_run_1,pmf,ess_min=63.0
+simulations/solvia_1_run_2/pmf/pmf_midplane/pmf_analysis_results.yaml,solvia_1_run_2,pmf,ess_min=62.8
+simulations/solvia_1045_run_2/pmf/pmf_midplane/pmf_analysis_results.yaml,solvia_1045_run_2,pmf,ess_min=61.4
+simulations/solvia_164_run_2/pmf/pmf_midplane/pmf_analysis_results.yaml,solvia_164_run_2,pmf,ess_min=78.1
+simulations/solvia_1743_run_1/pmf/pmf_midplane/pmf_analysis_results.yaml,solvia_1743_run_1,pmf,ess_min=57.6
+simulations/solvia_617_run_2/pmf/pmf_midplane/pmf_analysis_results.yaml,solvia_617_run_2,pmf,ess_min=51.5
+simulations/solvia_490_run_2/pmf/pmf_midplane/pmf_analysis_results.yaml,solvia_490_run_2,pmf,ess_min=25.6
+simulations/solvia_482_run_1/pmf/pmf_midplane/pmf_analysis_results.yaml,solvia_482_run_1,pmf,ess_min=79.3
+simulations/solvia_527_run_1/pmf/pmf_midplane/pmf_analysis_results.yaml,solvia_527_run_1,pmf,ess_min=22.7
+simulations/solvia_32_run_2/pmf/pmf_midplane/pmf_analysis_results.yaml,solvia_32_run_2,pmf,ess_min=13.8
+simulations/solvia_624_run_1/pmf/pmf_midplane/pmf_analysis_results.yaml,solvia_624_run_1,pmf,ess_min=55.4
+simulations/solvia_941_run_2/pmf/pmf_midplane/pmf_analysis_results.yaml,solvia_941_run_2,pmf,ess_min=76.8
+simulations/solvia_14_run_2/pmf/pmf_midplane/pmf_analysis_results.yaml,solvia_14_run_2,pmf,ess_min=44.7
+simulations/solvia_68_run_2/pmf/pmf_midplane/pmf_analysis_results.yaml,solvia_68_run_2,pmf,theta(1uM)=1.79e-06
+simulations/solvia_1023_run_2/pmf/pmf_midplane/pmf_analysis_results.yaml,solvia_1023_run_2,pmf,ess_min=74.0
+simulations/solvia_858_run_2/pmf/pmf_midplane/pmf_analysis_results.yaml,solvia_858_run_2,pmf,js_max_adjacent=0.50; ess_min=58.8; theta(1uM)=2.74e-06
+simulations/solvia_515_run_2/pmf/pmf_midplane/pmf_analysis_results.yaml,solvia_515_run_2,pmf,ess_min=43.1; theta(1uM)=5.15e-06
+simulations/solvia_1125_run_2/pmf/pmf_midplane/pmf_analysis_results.yaml,solvia_1125_run_2,pmf,theta(1uM)=4.93e-06
+simulations/solvia_12_run_2/pmf/pmf_midplane/pmf_analysis_results.yaml,solvia_12_run_2,pmf,ess_min=33.0
+simulations/solvia_8_run_2/pmf/pmf_midplane/pmf_analysis_results.yaml,solvia_8_run_2,pmf,ess_min=45.6
+simulations/solvia_524_run_2/pmf/pmf_midplane/pmf_analysis_results.yaml,solvia_524_run_2,pmf,ess_min=40.1
+simulations/solvia_974_run_2/pmf/pmf_midplane/pmf_analysis_results.yaml,solvia_974_run_2,pmf,ess_min=21.7
+simulations/solvia_1045_run_1/pmf/pmf_midplane/pmf_analysis_results.yaml,solvia_1045_run_1,pmf,ess_min=13.1; theta(1uM)=3.15e-06
+simulations/solvia_1_run_1/pmf/pmf_midplane/pmf_analysis_results.yaml,solvia_1_run_1,pmf,ess_min=71.9
+simulations/solvia_1743_run_2/pmf/pmf_midplane/pmf_analysis_results.yaml,solvia_1743_run_2,pmf,ess_min=29.1
+simulations/solvia_617_run_1/pmf/pmf_midplane/pmf_analysis_results.yaml,solvia_617_run_1,pmf,ess_min=86.2; theta(1uM)=4.09e-06
+simulations/solvia_527_run_2/pmf/pmf_midplane/pmf_analysis_results.yaml,solvia_527_run_2,pmf,ess_min=37.5
+simulations/solvia_32_run_1/pmf/pmf_midplane/pmf_analysis_results.yaml,solvia_32_run_1,pmf,ess_min=73.5
+simulations/solvia_490_run_1/pmf/pmf_midplane/pmf_analysis_results.yaml,solvia_490_run_1,pmf,ess_min=57.2
+simulations/solvia_14_run_1/pmf/pmf_midplane/pmf_analysis_results.yaml,solvia_14_run_1,pmf,ess_min=31.4
+simulations/solvia_624_run_2/pmf/pmf_midplane/pmf_analysis_results.yaml,solvia_624_run_2,pmf,ess_min=17.5
+simulations/solvia_941_run_1/pmf/pmf_midplane/pmf_analysis_results.yaml,solvia_941_run_1,pmf,ess_min=33.2
+simulations/solvia_858_run_1/pmf/pmf_midplane/pmf_analysis_results.yaml,solvia_858_run_1,pmf,ess_min=98.4
+simulations/solvia_215_run_2/pmf/pmf_midplane/pmf_analysis_results.yaml,solvia_215_run_2,pmf,ess_min=33.8
+simulations/solvia_68_run_1/pmf/pmf_midplane/pmf_analysis_results.yaml,solvia_68_run_1,pmf,ess_min=50.9; kp_eff=1.15nm (weak ads); theta(1uM)=7.29e-07
+simulations/solvia_1023_run_1/pmf/pmf_midplane/pmf_analysis_results.yaml,solvia_1023_run_1,pmf,ess_min=91.9
+simulations/solvia_1125_run_1/pmf/pmf_midplane/pmf_analysis_results.yaml,solvia_1125_run_1,pmf,theta(1uM)=3.65e-06
+simulations/solvia_515_run_1/pmf/pmf_midplane/pmf_analysis_results.yaml,solvia_515_run_1,pmf,ess_min=98.4

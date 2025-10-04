@@ -1,0 +1,4 @@
+Leave-one-peptide-out cross-validation (1p scaling)
+Folds: 24
+RMSE log10: 0.2461
+MAE log10: 0.1856

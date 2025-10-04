@@ -104,6 +104,7 @@ pmf:
   # Quality control gates
   qc:
     enabled: true
+    strict_mode: false         # Stop workflow early when ESS/overlap gates fail
     
     # Overlap requirements
     min_neighbor_overlap: 0.15  # Hard minimum
@@ -126,25 +127,29 @@ pmf:
     until_gates_pass: true    # run rounds until gates pass (ignore max_qc_rounds)
     max_qc_rounds: 0          # 0 = unlimited rounds when until_gates_pass=true
     auto_extend: true         # automatically extend windows on QC fail
-    extend_ns: 10.0           # per-iteration extension (ns)
+    extend_ns: 20.0           # per-iteration extension (ns)
     max_extend_ns: 80.0       # cap per window extension (ns)
     discard_fraction: 0.20    # discard initial fraction for QC (ESS/half-energy)
     ess_stride: "auto"        # automatic stride for ESS estimation (or integer ≥1)
+    require_half_convergence: true
     filter:                  # drop bad replicates per center before analysis
       enabled: true
       drop_if_half_fail: true
-      drop_if_drift_fail: false
-      min_ess_keep: 20       # keep replicate only if ESS >= this
+      drop_if_drift_fail: true
+      min_ess_keep: 200      # keep replicate only if ESS >= this
       min_keep_per_center: 1 # always keep at least the best replicate
       max_keep_per_center: 1 # cap survivors per center (1 = single best)
-      keep_best_if_all_filtered: true
+      keep_best_if_all_filtered: false
       prefer_by: half_then_ess
+      respect_gates: true
     fallback:                 # Fallback if QC gates still fail after rounds
       enabled: true
-      min_ess_trigger: 200    # replicate windows with ESS < this
-      replicate_count: 3      # N independent replicates per target window
-      per_replicate_ns: 50.0  # production per replicate (ns)
-      k_tune_scale: 1.2       # multiply k for these tough windows (e.g., 1.2x)
+      auto_after_extend: true
+      include_half_convergence: true
+      min_ess_trigger: 250    # replicate windows with ESS < this
+      replicate_count: 2      # N independent replicates per target window
+      per_replicate_ns: 40.0  # production per replicate (ns)
+      k_tune_scale: 1.4       # multiply k for these tough windows (e.g., 1.2x)
       ref_mode: global        # force global PO4 reference for fallback (po4_all)
       restart_from_neighbor: true  # for half_fail windows, start from nearest passing neighbor .gro
 
@@ -197,11 +202,11 @@ pmf:
       z_high: 1.6
       # Physical parameters for HC50 calculation
       area_per_lipid_nm2: 0.62
-      lp_star_range: [154, 515]
-      bilayer_factor: 2.0            # standard: normalize to bilayer (both leaflets)
+      lp_star_range: [45, 62]
+      bilayer_factor: 1.0            # one leaflet effective contribution by default
       # Size-aware L/P* (disabled by default; leave fixed)
       lp_star_mode: fixed            # auto_from_footprint | fixed
-      pack_factor: 1.0                    # packing correction (0.8–1.2 reasonable)
+      pack_factor: 20.0                    # effective exclusion zone (targets L/P* ≈ 50 for A≈1.5 nm²)
       footprint:
         mode: convex_hull
         contact_fraction: 0.4            # lowest fraction in z used as contact face

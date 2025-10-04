@@ -1,0 +1,74 @@
+HC50 calibration summary
+=======================
+Peptides with experimental HC50: 24
+Metadata matches: 24 / 2012
+Scale factor s (1p): 0.0839
+Shift (log10): -1.0762
+RMSE log10 (before -> after): 1.0034 -> 0.2307
+Spearman ρ (before -> after): 0.1566 -> 0.4822
+Weighted scale factor: 0.1284 (shift -0.8913)
+
+Gamma-based model log Γ* = α·ΔG + β
+n = 24
+α = -0.1086 (95% CI -0.2125, -0.0047)
+β = -9.3597 (95% CI -11.4629, -7.2566)
+r = -0.4195
+RMSE log10 = 0.4610
+Spearman ρ = 0.4549
+
+Rank-basiertes Modell (Basis)
+n = 24
+Spearman ρ = 0.8573
+Pearson r = 0.9621
+RMSE log10 = 0.1499
+LOO Spearman ρ = 0.7271
+Gewichte: delta_g=0.173, log_kp=0.471, log_gamma_model=-0.173, log_lp_model=0.173, log_theta=-0.383, log_seq_len=0.132, ess_mean=-0.176
+LOO RMSE log10 = 0.2141
+
+Rank-basiertes Modell (Enhanced)
+n = 24
+Alpha = 0.050
+Spearman ρ = 0.8752
+Pearson r = 0.9769
+RMSE log10 = 0.1111
+LOO Spearman ρ = 0.6778
+Intercept = -12.9385
+Koeffizienten: delta_g=0.020, delta_g_sq=0.005, log_kp=-0.102, log_kp_sq=-0.231, log_theta=0.014, log_theta_sq=-0.053, log_gamma=-0.421, log_lp=0.421, rank_score=0.767, ess_mean=-0.007, log_ess_mean=5.639, log_seq_len=0.395, z_ads=0.141, overlap_min=0.584, js_mean=9.917, delta_g_log_kp=0.001, delta_g_log_theta=0.000, delta_g_log_gamma=-0.068, log_kp_log_theta=-0.239, log_kp_log_gamma=0.049, rank_score_delta_g=0.007
+LOO RMSE log10 = 0.2419
+
+Rank-basiertes Modell (kNN)
+n = 24
+k = 7
+Spearman ρ = 1.0000
+Pearson r = 1.0000
+RMSE log10 = 0.0000
+LOO Spearman ρ = 0.5896
+LOO RMSE log10 = 0.2321
+
+Rank-basiertes Modell (Ensemble)
+n = 24
+Spearman ρ = 0.9134
+Pearson r = 0.9797
+RMSE log10 = 0.1082
+LOO Spearman ρ = 0.9126
+Intercept = 0.0000
+Koeffizienten: rank_basic=0.350, rank_enhanced=0.650
+LOO RMSE log10 = 0.1082
+
+Rank-basiertes Modell (v3)
+n = 24
+α = 0.2000
+l1_ratio = 0.050
+Spearman ρ = 0.8396
+Pearson r = 0.9268
+RMSE log10 = 0.1918
+CV Spearman ρ = 0.6761
+CV RMSE log10 = 0.2601
+CV MAE log10 = 0.2046
+
+Derived L/P* statistics:
+n = 24
+Median = 2183.946
+IQR = 1957.880
+[Q25, Q75] = [1530.854, 3488.733]
+[Q10, Q90] = [1023.334, 4562.457]

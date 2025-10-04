@@ -1,0 +1,28 @@
+source_columns:
+- DeltaG_ads_kJ_per_mol
+- DeltaG_ads_per_area_kJ_per_mol_nm2
+- DeltaG_ads_per_res_kJ_per_mol
+- DeltaG_barrier_kJ_per_mol
+- Kp_ads_nm
+- Kp_eff_nm
+- theta_at_1uM
+variance_threshold: 0.95
+means:
+- -19.41927995358061
+- -15.590076897499651
+- -0.9438330542991139
+- 11.301145817104242
+- 262.6269839386231
+- 262.6269839386231
+- 0.00024703087488421284
+components:
+- name: PMF_PC1
+  variance_ratio: 0.9997160114963257
+  loadings:
+    DeltaG_ads_kJ_per_mol: 0.00281162721948267
+    DeltaG_ads_per_area_kJ_per_mol_nm2: 0.002212187023187928
+    DeltaG_ads_per_res_kJ_per_mol: 8.154337219708613e-05
+    DeltaG_barrier_kJ_per_mol: 0.00037371728528527546
+    Kp_ads_nm: -0.7071022043052309
+    Kp_eff_nm: -0.7071022043052309
+    theta_at_1uM: -6.237447932434254e-07
