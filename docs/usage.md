@@ -129,7 +129,7 @@ Hinweise:
 cd /home/michelhuller/solvia
 
 # Run-Setup für einzelnes Peptid
-python3 scripts/universal/01_setup_run.py data/raw/fasta/SOLVIA_12.fasta
+python3 scripts/universal/01_setup_run.py data/raw/fasta/SOLVIA_794.fasta
 
 # Struktur:
 # simulations/solvia_1_run_1/
@@ -141,7 +141,7 @@ python3 scripts/universal/01_setup_run.py data/raw/fasta/SOLVIA_12.fasta
 
 ```bash
 # Variable für Run-Verzeichnis
-RUN_DIR="simulations/solvia_1219_run_1"
+RUN_DIR="simulations/solvia_253_run_1"
 
 # ColabFold für Strukturvorhersage
 docker compose run --rm \
@@ -174,6 +174,7 @@ python3 scripts/universal/03_coarse_grain.py ${RUN_DIR}
 # - Symlink-Erstellung für Kompatibilität
 # - Position Restraint Generation
 # - C-terminale Amidierung (NH2)
+# - Automatisierte Qualitätssicherung (angepasster Clash-Grenzwert + Relaxation bei Bedarf)
 ```
 
 **Parameter-Erklärung:**

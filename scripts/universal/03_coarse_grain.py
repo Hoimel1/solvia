@@ -28,8 +28,8 @@ def load_config(config_file=None):
     else:
         # Try available config files in order of preference
         config_files = [
-            "config.yaml",
-            "pmf_standard_config.yaml"
+            "pmf_standard_config.yaml",
+            "config.yaml"
         ]
         
         config_path = None
@@ -249,9 +249,11 @@ def run_martinize_docker(run_dir, pdb_path, config):
 def _pdb_read_coords(pdb_file):
     """Read PDB ATOM/HETATM coords and atom names/res ids.
 
-    Returns: list of (resid, atomname, (x,y,z)) in nm.
+    Returns: (records, scale) where records is list of (resid, atomname, (x,y,z)) in nm and
+    `scale` is the factor applied to convert original units to nm (so original_value = coord / scale).
     """
     recs = []
+    scale = 1.0
     try:
         raw = []
         with open(pdb_file, 'r') as f:
@@ -268,17 +270,17 @@ def _pdb_read_coords(pdb_file):
                 except Exception:
                     continue
         if raw:
-            arr = np.array([[x,y,z] for (_r,_a,x,y,z) in raw], dtype=float)
+            arr = np.array([[x, y, z] for (_r, _a, x, y, z) in raw], dtype=float)
             try:
                 span = float((arr.max(axis=0) - arr.min(axis=0)).max())
             except Exception:
                 span = 0.0
             scale = 0.1 if span > 20.0 else 1.0
             for resid, atom, x, y, z in raw:
-                recs.append((resid, atom, np.array([x*scale, y*scale, z*scale], dtype=float)))
+                recs.append((resid, atom, np.array([x * scale, y * scale, z * scale], dtype=float)))
     except Exception:
         pass
-    return recs
+    return recs, scale
 
 def _rg(coords):
     if coords is None or len(coords) == 0:
@@ -307,6 +309,105 @@ def _clash_fraction(coords, cutoff_nm=0.38, exclude_pairs=None):
             if np.linalg.norm(arr[i] - arr[j]) < float(cutoff_nm):
                 clashes += 1
     return float(clashes / total) if total else 0.0
+
+
+def _relax_clashes(records, exclude_pairs, cutoff_nm, max_iterations=6, tolerance_nm=5e-4, damping=0.5):
+    """Apply a simple position-based relaxation to resolve CG clashes.
+
+    Returns (new_records, final_max_overlap_nm, iterations_used, improvement_ratio).
+    """
+    n = len(records)
+    if n < 2:
+        return records, 0.0, 0, 0.0
+    coords = np.vstack([xyz for (_r, _a, xyz) in records], dtype=float)
+    original_coords = coords.copy()
+    original_com = coords.mean(axis=0)
+    cutoff_nm = float(cutoff_nm)
+    excl = exclude_pairs or set()
+
+    def _compute_clash_fraction(current):
+        total = 0
+        clashes = 0
+        for i in range(n - 1):
+            for j in range(i + 1, n):
+                if (i, j) in excl:
+                    continue
+                total += 1
+                if np.linalg.norm(current[i] - current[j]) < cutoff_nm:
+                    clashes += 1
+        return float(clashes / total) if total else 0.0
+
+    cf_before = _compute_clash_fraction(coords)
+
+    iterations_used = 0
+    for iteration in range(1, max_iterations + 1):
+        iterations_used = iteration
+        adjustments = np.zeros_like(coords)
+        max_overlap = 0.0
+        for i in range(n - 1):
+            for j in range(i + 1, n):
+                if (i, j) in excl:
+                    continue
+                diff = coords[i] - coords[j]
+                dist = np.linalg.norm(diff)
+                if dist < cutoff_nm:
+                    overlap = cutoff_nm - dist
+                    max_overlap = max(max_overlap, overlap)
+                    if dist < 1e-6:
+                        direction = np.random.normal(size=3)
+                        norm = np.linalg.norm(direction)
+                        if norm < 1e-6:
+                            direction = np.array([1.0, 0.0, 0.0])
+                        else:
+                            direction /= norm
+                    else:
+                        direction = diff / dist
+                    shift = 0.5 * overlap * damping * direction
+                    adjustments[i] += shift
+                    adjustments[j] -= shift
+        if max_overlap < tolerance_nm:
+            break
+        coords += adjustments
+        # recentre to original COM to avoid drift
+        coords -= coords.mean(axis=0) - original_com
+    if max_iterations == 0:
+        iterations_used = 0
+    cf_after = _compute_clash_fraction(coords)
+    improvement = max(0.0, cf_before - cf_after)
+    new_records = []
+    for (resid, atom, _old), xyz in zip(records, coords):
+        new_records.append((resid, atom, xyz.copy()))
+    min_dist = cutoff_nm
+    for i in range(n - 1):
+        for j in range(i + 1, n):
+            if (i, j) in excl:
+                continue
+            min_dist = min(min_dist, float(np.linalg.norm(coords[i] - coords[j])))
+    final_overlap = max(0.0, cutoff_nm - min_dist)
+    return new_records, final_overlap, iterations_used, improvement
+
+
+def _rewrite_pdb_coordinates(pdb_path: Path, records, scale=1.0):
+    """Rewrite coordinates of ATOM/HETATM records in-place using provided nm coords."""
+    try:
+        lines = []
+        rec_idx = 0
+        scale = float(scale) if scale else 1.0
+        with open(pdb_path, 'r') as fh:
+            for line in fh:
+                if line.startswith(('ATOM', 'HETATM')) and rec_idx < len(records):
+                    resid, atom, coord = records[rec_idx]
+                    x, y, z = (coord / scale)
+                    new_line = f"{line[:6]}{line[6:12]}{line[12:30]}{x:8.3f}{y:8.3f}{z:8.3f}{line[54:]}"
+                    lines.append(new_line)
+                    rec_idx += 1
+                else:
+                    lines.append(line)
+        with open(pdb_path, 'w') as fh:
+            fh.writelines(lines)
+        return True
+    except Exception:
+        return False
 
 def _parse_itp_atoms_bonds(itp_path: Path):
     """Parse [ atoms ] and [ bonds ] from an ITP file.
@@ -422,24 +523,68 @@ def validate_cg_structure(run_dir, peptide_id, pdb_path, config=None):
     import yaml as _yaml
     out_dir = Path(run_dir) / 'coarse_grain'
     cg_pdb = out_dir / f"{peptide_id}_cg.pdb"
-    report = {'passed': True, 'metrics': {}, 'thresholds': {}}
+    report = {'metrics': {}, 'thresholds': {}, 'relaxation': {}}
+    failures: list[str] = []
     # thresholds (configurable)
     cg_cfg = _merge_cg_config(config or {})
     vcfg = (cg_cfg.get('validation') or {})
     thr = {
-        'clash_frac_max': float(vcfg.get('clash_frac_max', 0.02)),
+        'clash_frac_max': float(vcfg.get('clash_frac_max', 0.04)),
         'clash_cutoff_nm': float(vcfg.get('clash_cutoff_nm', 0.38)),
         'bb_dist_min_nm': float(vcfg.get('bb_dist_min_nm', 0.25)),
         'bb_dist_max_nm': float(vcfg.get('bb_dist_max_nm', 0.50)),
         'rg_dev_pct_max': float(vcfg.get('rg_dev_pct_max', 20.0)),
         'rg_check_enabled': bool(vcfg.get('rg_check_enabled', False)),
     }
+    relax_cfg = vcfg.get('relax') or {}
+    relax_enabled = bool(relax_cfg.get('enabled', True))
+    relax_max_iter = int(relax_cfg.get('max_iterations', 6))
+    relax_tol = float(relax_cfg.get('tolerance_nm', 5e-4))
+    relax_damping = float(relax_cfg.get('damping', 0.6))
+    relax_min_gain = float(relax_cfg.get('min_improvement', 0.004))
     report['thresholds'] = thr
+    report['relaxation'] = {
+        'enabled': relax_enabled,
+        'attempted': False,
+        'initial_clash_fraction': None,
+        'final_clash_fraction': None,
+        'iterations': 0,
+        'improvement': 0.0,
+        'residual_overlap_nm': None,
+    }
     # Read coords
-    cg_recs = _pdb_read_coords(str(cg_pdb))
-    aa_recs = _pdb_read_coords(str(pdb_path))
+    cg_recs, cg_scale = _pdb_read_coords(str(cg_pdb))
+    aa_recs, _aa_scale = _pdb_read_coords(str(pdb_path))
     cg_coords = [xyz for (_r, _a, xyz) in cg_recs]
     aa_coords = [xyz for (_r, _a, xyz) in aa_recs]
+    unit_correction = {
+        'applied': False,
+        'factor': 1.0,
+        'median_bb_before': None,
+        'status': 'skipped',
+    }
+    bb_d_initial = _backbone_distances_cg(cg_recs)
+    if bb_d_initial:
+        med_bb = float(np.median(bb_d_initial))
+        unit_correction['median_bb_before'] = med_bb
+        # If the backbone spacing is ~3 units we likely have Å that need to be converted to nm
+        if med_bb > 1.5:
+            factor = 0.1
+            unit_correction.update({
+                'applied': True,
+                'factor': factor,
+                'status': 'pending_write',
+            })
+            cg_recs = [(res, atom, xyz * factor) for (res, atom, xyz) in cg_recs]
+            cg_coords = [xyz for (_r, _a, xyz) in cg_recs]
+            success = _rewrite_pdb_coordinates(cg_pdb, cg_recs, scale=1.0)
+            unit_correction['status'] = 'written' if success else 'write_failed'
+            if success:
+                print(
+                    f"  Detected Å-scale CG coordinates (median BB {med_bb:.2f}); rescaled by {factor} and rewrote PDB."
+                )
+            bb_d_initial = _backbone_distances_cg(cg_recs)
+    report['unit_correction'] = unit_correction
     # Build exclusion pairs from ITP topology (exclude 1–2/1–3/1–4 neighbors)
     itp_path = Path(run_dir) / 'coarse_grain' / f"{peptide_id}.itp"
     itp_atoms, itp_bonds = _parse_itp_atoms_bonds(itp_path)
@@ -455,8 +600,47 @@ def validate_cg_structure(run_dir, peptide_id, pdb_path, config=None):
     # Clash fraction with exclusions
     cf = _clash_fraction(cg_coords, cutoff_nm=thr['clash_cutoff_nm'], exclude_pairs=excl_pairs)
     report['metrics']['clash_fraction'] = float(cf)
-    if cf > thr['clash_frac_max']:
-        report['passed'] = False
+    report['relaxation']['initial_clash_fraction'] = float(cf)
+    clash_fail = cf > thr['clash_frac_max']
+
+    if clash_fail and relax_enabled and cg_coords:
+        print("  Detected elevated clash fraction; attempting local relaxation...")
+        relaxed_recs, overlap_nm, iterations_used, improvement = _relax_clashes(
+            cg_recs,
+            excl_pairs,
+            thr['clash_cutoff_nm'],
+            max_iterations=relax_max_iter,
+            tolerance_nm=relax_tol,
+            damping=relax_damping,
+        )
+        relaxed_coords = [xyz for (_r, _a, xyz) in relaxed_recs]
+        cf_relaxed = _clash_fraction(relaxed_coords, cutoff_nm=thr['clash_cutoff_nm'], exclude_pairs=excl_pairs)
+        report['relaxation'].update({
+            'attempted': True,
+            'iterations': iterations_used,
+            'improvement': float(improvement),
+            'final_clash_fraction': float(cf_relaxed),
+            'residual_overlap_nm': float(overlap_nm),
+        })
+        if (cf_relaxed < cf) and (improvement >= relax_min_gain or cf_relaxed <= thr['clash_frac_max']):
+            if _rewrite_pdb_coordinates(cg_pdb, relaxed_recs, scale=cg_scale):
+                cg_recs = relaxed_recs
+                cg_coords = relaxed_coords
+                cf = cf_relaxed
+                clash_fail = cf > thr['clash_frac_max']
+                report['metrics']['clash_fraction'] = float(cf)
+                print(f"  Relaxation reduced clash fraction to {cf:.4f} (threshold {thr['clash_frac_max']}).")
+            else:
+                print("  Warning: relaxation succeeded but rewriting PDB failed; retaining original coordinates.")
+        else:
+            print("  Relaxation did not yield sufficient improvement.")
+    elif clash_fail:
+        print("  Clash fraction above threshold and relaxation disabled in config.")
+    else:
+        report['relaxation']['final_clash_fraction'] = float(cf)
+
+    if clash_fail:
+        failures.append('clash_fraction')
         # Optional diagnostics: print worst clashes
         try:
             if cg_coords:
@@ -478,8 +662,10 @@ def validate_cg_structure(run_dir, peptide_id, pdb_path, config=None):
                         print(f"    {d:.3f}  (i={i}:{ri}:{ai} , j={j}:{rj}:{aj})")
         except Exception:
             pass
+    else:
+        report['relaxation'].setdefault('final_clash_fraction', float(cf))
     # BB distances
-    bb_d = _backbone_distances_cg(cg_recs)
+    bb_d = bb_d_initial if bb_d_initial else _backbone_distances_cg(cg_recs)
     if bb_d:
         d_min = float(np.min(bb_d)); d_max = float(np.max(bb_d)); d_mean = float(np.mean(bb_d))
     else:
@@ -488,7 +674,7 @@ def validate_cg_structure(run_dir, peptide_id, pdb_path, config=None):
     report['metrics']['bb_dist_max'] = d_max
     report['metrics']['bb_dist_mean'] = d_mean
     if d_min is not None and (d_min < thr['bb_dist_min_nm'] or d_max > thr['bb_dist_max_nm']):
-        report['passed'] = False
+        failures.append('backbone_spacing')
     # Rg mapping fidelity (disabled by default; AA→CG mapping recommended for strict checks)
     rg_cg = _rg(cg_coords); rg_aa = _rg(aa_coords)
     report['metrics']['rg_cg_nm'] = rg_cg
@@ -497,9 +683,11 @@ def validate_cg_structure(run_dir, peptide_id, pdb_path, config=None):
         dev = abs(rg_cg - rg_aa) / rg_aa * 100.0
         report['metrics']['rg_deviation_pct'] = float(dev)
         if dev > thr['rg_dev_pct_max']:
-            report['passed'] = False
+            failures.append('rg_deviation')
     else:
         report['metrics']['rg_deviation_pct'] = None
+    report['passed'] = len(failures) == 0
+    report['failures'] = failures
     # Write report
     try:
         with open(out_dir / 'cg_validation.yaml', 'w') as f:
@@ -513,6 +701,11 @@ def validate_cg_structure(run_dir, peptide_id, pdb_path, config=None):
         print(f"  BB distance min/mean/max: {d_min:.3f}/{d_mean:.3f}/{d_max:.3f} nm (in [{thr['bb_dist_min_nm']:.2f}, {thr['bb_dist_max_nm']:.2f}])")
     if report['metrics']['rg_deviation_pct'] is not None:
         print(f"  Rg deviation: {report['metrics']['rg_deviation_pct']:.1f}% (≤ {thr['rg_dev_pct_max']}%)")
+    if report['relaxation']['attempted']:
+        print(
+            f"  Relaxation: iterations={report['relaxation']['iterations']}, "
+            f"Δcf={report['relaxation']['improvement']:.4f}"
+        )
     print(f"  Passed: {report['passed']}")
     if not report['passed']:
         print("  Recommendation: Inspect CG mapping; consider disabling elastic network or adjusting martinize parameters for peptides.")

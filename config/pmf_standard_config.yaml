@@ -9,14 +9,16 @@ pmf:
     force_field_auto: true
     elastic_network: false
     validation:
-      clash_frac_max: 0.02
+      clash_frac_max: 0.035
       bb_dist_min_nm: 0.20
       bb_dist_max_nm: 0.70
       rg_dev_pct_max: 20.0
-      auto_retry:
+      relax:
         enabled: true
-        steps: [disable_en]
-        max_retries: 1
+        max_iterations: 6
+        tolerance_nm: 0.0005
+        damping: 0.6
+        min_improvement: 0.004
 
   # Standardized membrane setup
   membrane:

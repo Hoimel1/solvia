@@ -36,8 +36,8 @@ def load_config(config_file=None):
     else:
         # Try available config files in order of preference
         config_files = [
-            "config.yaml",
-            "pmf_standard_config.yaml"
+            "pmf_standard_config.yaml",
+            "config.yaml"
         ]
         
         config_path = None
@@ -158,6 +158,13 @@ def validate_and_normalize_config(cfg: dict) -> dict:
     except Exception:
         raise ValueError("simulation.npt.compressibility must be float")
 
+    perf = cfg.setdefault('performance', {})
+    try:
+        cpu_threads = int(perf.get('cpu_threads', 4))
+    except Exception as exc:
+        raise ValueError("performance.cpu_threads must be an integer") from exc
+    perf['cpu_threads'] = max(1, cpu_threads)
+
     cfg['__validated__'] = True
     return cfg
 
@@ -174,6 +181,22 @@ def _docker_available(project_root: Path) -> bool:
         return r.returncode == 0 and (project_root / "docker-compose.yml").exists()
     except Exception:
         return False
+
+
+def _has_lincs_issue(diagnostics: dict | None) -> bool:
+    """Detect classic LINCS/constraint failures from mdrun diagnostics."""
+    if not diagnostics:
+        return False
+    text = diagnostics.get('combined') or ''
+    lowered = text.lower()
+    lincs_markers = (
+        'lincs warning',
+        'constraint error',
+        'constraint failure',
+        'relative constraint deviation',
+        'bonds that rotated more than',
+    )
+    return any(marker in lowered for marker in lincs_markers)
 
 
 class EquilibrationError(RuntimeError):
@@ -578,48 +601,68 @@ def run_grompp(mdp_file, coord_file, top_file, output_tpr,
     return True
 
 def run_mdrun(tpr_file, output_prefix, nt=None, append_restart=False):
-    """Run GROMACS mdrun via Docker (preferred) or host fallback."""
-    # Get relative paths from project root
+    """Run GROMACS mdrun via Docker (preferred) or host fallback.
+
+    Returns (success: bool, diagnostics: dict).
+    """
     project_root = Path(__file__).parent.parent.parent
-    rel_tpr = os.path.relpath(tpr_file, project_root)
     rel_prefix = os.path.relpath(output_prefix, project_root)
-    # Container working dir: parent of output_prefix
     out_dir = os.path.dirname(output_prefix)
     rel_out_dir = os.path.relpath(out_dir, project_root)
 
     use_docker = _docker_available(project_root) and (os.environ.get("USE_DOCKER", "1") != "0")
+    base_cmd = [
+        "docker", "compose", "run", "--rm", "--workdir", f"/work/{rel_out_dir}", "gromacs"
+    ] if use_docker else ["gmx"]
+    deffnm_arg = f"/work/{rel_prefix}" if use_docker else os.path.abspath(output_prefix)
+    workdir = str(project_root) if use_docker else (out_dir or str(project_root))
 
-    if use_docker:
-        cmd = [
-            "docker", "compose", "run", "--rm", "--workdir", f"/work/{rel_out_dir}", "gromacs",
-            "mdrun",
-            "-v",
-            "-deffnm", f"/work/{rel_prefix}"
-        ]
-    else:
-        cmd = [
-            "gmx", "mdrun",
-            "-v",
-            "-deffnm", os.path.abspath(output_prefix)
-        ]
+    attempted_single_thread = False
+    effective_nt = nt
+    append_logged = False
 
-    if nt:
-        cmd.extend(["-nt", str(nt)])
+    while True:
+        cmd = base_cmd + ["mdrun", "-v", "-deffnm", deffnm_arg]
+        if effective_nt:
+            cmd.extend(["-nt", str(effective_nt)])
+        if append_restart:
+            cmd.append("-append")
+            if not append_logged:
+                logging.info("Using -append flag for checkpoint restart")
+                append_logged = True
 
-    if append_restart:
-        cmd.append("-append")
-        logging.info("Using -append flag for checkpoint restart")
+        result = subprocess.run(cmd, capture_output=True, text=True, cwd=workdir)
+        stdout_text = result.stdout or ""
+        stderr_text = result.stderr or ""
+        combined = (stdout_text + "\n" + stderr_text).strip()
+        diagnostics = {
+            'stdout': stdout_text,
+            'stderr': stderr_text,
+            'combined': combined,
+            'cmd': cmd,
+            'nt': effective_nt,
+        }
 
-    # Run; set cwd to out_dir so emergency PDBs land in the right folder
-    result = subprocess.run(cmd, capture_output=True, text=True, cwd=(str(project_root) if use_docker else out_dir or str(project_root)))
-    if result.returncode != 0:
-        logging.error(f"MDRUN failed:")
-        if result.stdout:
-            logging.error(f"STDOUT: {result.stdout}")
-        if result.stderr:
-            logging.error(f"STDERR: {result.stderr}")
-        return False
-    return True
+        if result.returncode == 0:
+            return True, diagnostics
+
+        lowered = combined.lower()
+        domain_error = "domain decomposition" in lowered or "minimum cell size" in lowered
+        if domain_error and not attempted_single_thread and effective_nt and int(effective_nt) > 1:
+            logging.warning(
+                "MDRUN domain decomposition failed with nt=%s; retrying with single thread.",
+                effective_nt,
+            )
+            attempted_single_thread = True
+            effective_nt = 1
+            continue
+
+        logging.error("MDRUN failed:")
+        if stdout_text:
+            logging.error(f"STDOUT: {stdout_text}")
+        if stderr_text:
+            logging.error(f"STDERR: {stderr_text}")
+        return False, diagnostics
 
 def equilibrate_system(run_dir, occupancy="low", tag: str | None = None, config=None):
     """Run complete equilibration workflow with robust error handling."""
@@ -667,8 +710,35 @@ def equilibrate_system(run_dir, occupancy="low", tag: str | None = None, config=
         if not os.path.exists(system_gro):
             raise EquilibrationError(f"System file not found: {system_gro}")
 
+        # Track current timestep for adaptive retries
+        current_dt = float(config.get('simulation', {}).get('timestep', 0.02))
+        initial_dt = current_dt
+        config.setdefault('simulation', {})['timestep'] = current_dt
+        max_stage_attempts = 3
+
         # Create MDP files
         mdp_dir = create_mdp_files(run_dir, config)
+
+        def reduce_timestep(stage_label: str) -> bool:
+            """Halve the timestep (down to 0.005 ps) and regenerate MDPs."""
+            nonlocal current_dt, mdp_dir
+            new_dt = max(current_dt / 2.0, 0.005)
+            if new_dt >= current_dt - 1e-12:
+                logger.error(
+                    "%s failed and timestep cannot be reduced further (%.4f ps).",
+                    stage_label,
+                    current_dt,
+                )
+                return False
+            current_dt = new_dt
+            config['simulation']['timestep'] = current_dt
+            logger.warning(
+                "%s suffered LINCS issues; reducing timestep to %.4f ps and regenerating MDPs.",
+                stage_label,
+                current_dt,
+            )
+            mdp_dir = create_mdp_files(run_dir, config)
+            return True
 
         # Energy minimization
         logger.info("Starting Energy Minimization")
@@ -682,7 +752,8 @@ def equilibrate_system(run_dir, occupancy="low", tag: str | None = None, config=
             raise EquilibrationError("EM grompp failed")
 
         logger.info("Running energy minimization")
-        if not run_mdrun(em_tpr, os.path.join(em_dir, "em"), config['performance']['cpu_threads']):
+        success, _ = run_mdrun(em_tpr, os.path.join(em_dir, "em"), config['performance']['cpu_threads'])
+        if not success:
             raise EquilibrationError("Energy minimization failed")
 
         # Check EM results
@@ -693,19 +764,43 @@ def equilibrate_system(run_dir, occupancy="low", tag: str | None = None, config=
         else:
             raise EquilibrationError("Energy minimization output not found")
 
-        # NVT equilibration
+        # NVT equilibration (allow timestep fallback on LINCS issues)
         logger.info("Starting NVT Equilibration")
         nvt_dir = os.path.join(run_dir, "equilibration", "nvt")
         os.makedirs(nvt_dir, exist_ok=True)
-        nvt_mdp = os.path.join(mdp_dir, "nvt.mdp")
-        nvt_tpr = os.path.join(nvt_dir, "nvt.tpr")
+        nvt_time_ps = float(config.get('simulation', {}).get('nvt', {}).get('time', 2000.0))
+        nvt_attempt = 0
 
-        logger.info("Running GROMPP for NVT equilibration")
-        if not run_grompp(nvt_mdp, em_gro, system_top, nvt_tpr, ref_file=em_gro):
-            raise EquilibrationError("NVT grompp failed")
+        while True:
+            nvt_attempt += 1
+            nvt_mdp = os.path.join(mdp_dir, "nvt.mdp")
+            nvt_tpr = os.path.join(nvt_dir, "nvt.tpr")
 
-        logger.info(f"Running NVT equilibration ({config['simulation']['nvt']['time']} ps)")
-        if not run_mdrun(nvt_tpr, os.path.join(nvt_dir, "nvt"), config['performance']['cpu_threads']):
+            logger.info("Running GROMPP for NVT equilibration (attempt %d)", nvt_attempt)
+            if not run_grompp(nvt_mdp, em_gro, system_top, nvt_tpr, ref_file=em_gro):
+                raise EquilibrationError("NVT grompp failed")
+
+            logger.info(
+                "Running NVT equilibration (%.1f ps @ %.4f ps timestep)",
+                nvt_time_ps,
+                current_dt,
+            )
+            nvt_success, nvt_diag = run_mdrun(
+                nvt_tpr,
+                os.path.join(nvt_dir, "nvt"),
+                config['performance']['cpu_threads'],
+            )
+
+            if nvt_success:
+                break
+
+            if (
+                _has_lincs_issue(nvt_diag)
+                and nvt_attempt < max_stage_attempts
+                and reduce_timestep("NVT equilibration")
+            ):
+                continue
+
             raise EquilibrationError("NVT equilibration failed")
 
         nvt_gro = os.path.join(nvt_dir, "nvt.gro")
@@ -721,14 +816,34 @@ def equilibrate_system(run_dir, occupancy="low", tag: str | None = None, config=
         # Stage 1: Berendsen
         npt1_dir = os.path.join(run_dir, "equilibration", "npt_ber")
         os.makedirs(npt1_dir, exist_ok=True)
-        npt1_mdp = os.path.join(mdp_dir, "npt_ber.mdp")
-        npt1_tpr = os.path.join(npt1_dir, "npt_ber.tpr")
-        logger.info("Running GROMPP for NPT (Berendsen)")
-        if not run_grompp(npt1_mdp, nvt_gro, system_top, npt1_tpr, ref_file=nvt_gro, cpt_file=nvt_cpt):
-            raise EquilibrationError("NPT (Berendsen) grompp failed")
-        logger.info("Running NPT (Berendsen) stage")
-        if not run_mdrun(npt1_tpr, os.path.join(npt1_dir, "npt_ber"), config['performance']['cpu_threads']):
+        npt1_attempt = 0
+
+        while True:
+            npt1_attempt += 1
+            npt1_mdp = os.path.join(mdp_dir, "npt_ber.mdp")
+            npt1_tpr = os.path.join(npt1_dir, "npt_ber.tpr")
+            logger.info("Running GROMPP for NPT (Berendsen) (attempt %d)", npt1_attempt)
+            if not run_grompp(npt1_mdp, nvt_gro, system_top, npt1_tpr, ref_file=nvt_gro, cpt_file=nvt_cpt):
+                raise EquilibrationError("NPT (Berendsen) grompp failed")
+            logger.info("Running NPT (Berendsen) stage (dt=%.4f ps)", current_dt)
+            npt1_success, npt1_diag = run_mdrun(
+                npt1_tpr,
+                os.path.join(npt1_dir, "npt_ber"),
+                config['performance']['cpu_threads'],
+            )
+
+            if npt1_success:
+                break
+
+            if (
+                _has_lincs_issue(npt1_diag)
+                and npt1_attempt < max_stage_attempts
+                and reduce_timestep("NPT (Berendsen)")
+            ):
+                continue
+
             raise EquilibrationError("NPT (Berendsen) failed")
+
         npt1_gro = os.path.join(npt1_dir, "npt_ber.gro")
         npt1_cpt = os.path.join(npt1_dir, "npt_ber.cpt")
         if os.path.exists(npt1_gro):
@@ -739,14 +854,34 @@ def equilibrate_system(run_dir, occupancy="low", tag: str | None = None, config=
         # Stage 2: Parrinello-Rahman
         npt2_dir = os.path.join(run_dir, "equilibration", "npt_pr")
         os.makedirs(npt2_dir, exist_ok=True)
-        npt2_mdp = os.path.join(mdp_dir, "npt_pr.mdp")
-        npt2_tpr = os.path.join(npt2_dir, "npt_pr.tpr")
-        logger.info("Running GROMPP for NPT (Parrinello-Rahman)")
-        if not run_grompp(npt2_mdp, npt1_gro, system_top, npt2_tpr, ref_file=npt1_gro, cpt_file=npt1_cpt):
-            raise EquilibrationError("NPT (Parrinello-Rahman) grompp failed")
-        logger.info("Running NPT (Parrinello-Rahman) stage")
-        if not run_mdrun(npt2_tpr, os.path.join(npt2_dir, "npt_pr"), config['performance']['cpu_threads']):
+        npt2_attempt = 0
+
+        while True:
+            npt2_attempt += 1
+            npt2_mdp = os.path.join(mdp_dir, "npt_pr.mdp")
+            npt2_tpr = os.path.join(npt2_dir, "npt_pr.tpr")
+            logger.info("Running GROMPP for NPT (Parrinello-Rahman) (attempt %d)", npt2_attempt)
+            if not run_grompp(npt2_mdp, npt1_gro, system_top, npt2_tpr, ref_file=npt1_gro, cpt_file=npt1_cpt):
+                raise EquilibrationError("NPT (Parrinello-Rahman) grompp failed")
+            logger.info("Running NPT (Parrinello-Rahman) stage (dt=%.4f ps)", current_dt)
+            npt2_success, npt2_diag = run_mdrun(
+                npt2_tpr,
+                os.path.join(npt2_dir, "npt_pr"),
+                config['performance']['cpu_threads'],
+            )
+
+            if npt2_success:
+                break
+
+            if (
+                _has_lincs_issue(npt2_diag)
+                and npt2_attempt < max_stage_attempts
+                and reduce_timestep("NPT (Parrinello-Rahman)")
+            ):
+                continue
+
             raise EquilibrationError("NPT (Parrinello-Rahman) failed")
+
         npt2_gro = os.path.join(npt2_dir, "npt_pr.gro")
         npt2_cpt = os.path.join(npt2_dir, "npt_pr.cpt")
         if os.path.exists(npt2_gro):
@@ -756,6 +891,13 @@ def equilibrate_system(run_dir, occupancy="low", tag: str | None = None, config=
             summary['final_checkpoint'] = 'equilibration/npt_pr/npt_pr.cpt'
         else:
             raise EquilibrationError("NPT (Parrinello-Rahman) output not found")
+
+        if abs(current_dt - initial_dt) > 1e-6:
+            logger.info(
+                "Adaptive timestep: reduced from %.4f ps to %.4f ps during equilibration.",
+                initial_dt,
+                current_dt,
+            )
 
         logger.info(f"\u2713 Equilibration complete for {metadata['peptide_id']} ({use_tag})")
         return npt2_gro

@@ -377,8 +377,8 @@ def load_config():
     
     # Try available config files in order of preference
     config_files = [
-        "config.yaml",
-        "pmf_standard_config.yaml"
+        "pmf_standard_config.yaml",
+        "config.yaml"
     ]
     
     for config_file in config_files:
